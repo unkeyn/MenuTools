@@ -1,4 +1,4 @@
-﻿# MenuTools & Fullscreen Scaler Automated Build Script
+# MenuTools & Fullscreen Scaler Automated Build Script
 $ErrorActionPreference = "Stop"
 
 $MinGW = "C:\Users\unkeyn\scoop\apps\mingw-mstorsjo-llvm-msvcrt\current\bin"
@@ -70,7 +70,7 @@ if ($LASTEXITCODE -ne 0) { throw "MenuTools.exe failed" }
 Write-Host "== Step 6: Compile MenuToolsScaler.exe ==" -ForegroundColor Cyan
 & $Clang64 -std=c++17 -municode -mwindows -D_UNICODE -DUNICODE -O2 -static "-Wl,--gc-sections" -I "$Root" -I "$Root\Scaler" -I "$Root\MenuCommon" `
     "$Root\Scaler\ScalerMain.cpp" -o "$Root\MenuToolsScaler.exe" `
-    -ld3d11 -ldxgi -lruntimeobject -lole32 -loleaut32 -luser32 -lgdi32 -ladvapi32 -lshlwapi
+    -ld3d11 -ldxgi -ldwmapi -lruntimeobject -lole32 -loleaut32 -luser32 -lgdi32 -ladvapi32 -lshlwapi
 if ($LASTEXITCODE -ne 0) { throw "MenuToolsScaler.exe failed" }
 
 Copy-Item "$Root\MenuToolsScaler.exe" "$Root\Scaler\MenuToolsScaler.exe" -Force

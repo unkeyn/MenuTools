@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <tchar.h>
+#include <dwmapi.h>
 #define boolean bool
 #include <initguid.h>
 #include <winstring.h>
@@ -37,11 +38,38 @@
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "runtimeobject.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "shlwapi.lib")
+
+// DWM API Constant Guards
+#ifndef DWMWA_EXTENDED_FRAME_BOUNDS
+#define DWMWA_EXTENDED_FRAME_BOUNDS 9
+#endif
+#ifndef DWMWA_NCRENDERING_ENABLED
+#define DWMWA_NCRENDERING_ENABLED 1
+#endif
+#ifndef DWMWA_WINDOW_CORNER_PREFERENCE
+#define DWMWA_WINDOW_CORNER_PREFERENCE 33
+#endif
+#ifndef DWMWA_BORDER_COLOR
+#define DWMWA_BORDER_COLOR 34
+#endif
+#ifndef DWMWA_COLOR_NONE
+#define DWMWA_COLOR_NONE 0xFFFFFFFE
+#endif
+#ifndef DWMWA_VISIBLE_FRAME_BORDER_THICKNESS
+#define DWMWA_VISIBLE_FRAME_BORDER_THICKNESS 37
+#endif
+#ifndef DWMWCP_DEFAULT
+#define DWMWCP_DEFAULT 0
+#define DWMWCP_DONOTROUND 1
+#define DWMWCP_ROUND 2
+#define DWMWCP_ROUNDSMALL 3
+#endif
 
 // Scaler Constant Buffer Struct (matches HLSL ScalerCB)
 struct ScalerCBData
@@ -94,9 +122,15 @@ static bool g_RoInitialized = false;
 static HANDLE g_hActiveMutex = NULL;
 static HANDLE g_hExitEvent = NULL;
 static HANDLE g_hFrameEvent = NULL;
+static HANDLE g_hTargetProcess = NULL;
 static HWINEVENTHOOK g_hForegroundHook = NULL;
 static HWINEVENTHOOK g_hMinimizeHook = NULL;
+static HWINEVENTHOOK g_hLocationHook = NULL;
 static std::atomic_bool g_ExitRequested{ false };
+static std::atomic_bool g_GeometryDirty{ true };
+
+static DWORD g_PrevTargetCornerPref = DWMWCP_DEFAULT;
+static bool g_HasTargetCornerPref = false;
 
 static HWND g_ScalerHWnd = NULL;
 static HWND g_TargetHWnd = NULL;
@@ -110,9 +144,13 @@ static int g_VpY = 0;
 static int g_VpW = 0;
 static int g_VpH = 0;
 
-// WGC window texture -> target client area offset & size
-static int g_ClientCaptureX = 0;
-static int g_ClientCaptureY = 0;
+// Resolved WGC texture-space crop & source rect
+static RECT g_CaptureBounds = { 0 };
+static RECT g_DesiredSourceRect = { 0 };
+static int g_CropOffsetX = 0;
+static int g_CropOffsetY = 0;
+static int g_CropSizeW = 0;
+static int g_CropSizeH = 0;
 static int g_ClientW = 0;
 static int g_ClientH = 0;
 
@@ -121,6 +159,10 @@ static int g_SourceViewX = 0;
 static int g_SourceViewY = 0;
 static int g_SourceViewW = 0;
 static int g_SourceViewH = 0;
+
+static ABI::Windows::Graphics::SizeInt32 g_CachedContentSize{ 0, 0 };
+static ABI::Windows::Graphics::SizeInt32 g_CaptureItemSize{ 0, 0 };
+static ABI::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice* g_pDirect3DDevice = nullptr;
 
 static ID3D11Device* g_pDevice = nullptr;
 static ID3D11DeviceContext* g_pContext = nullptr;
@@ -181,7 +223,8 @@ static ABI::Windows::Graphics::Capture::IGraphicsCaptureSession* g_pSession = nu
 // Forward Declarations
 void ShutdownScaler();
 void RenderFrame();
-void UpdateGeometry(int screenW, int screenH);
+void UpdateGeometry(int screenW, int screenH, int captureW, int captureH);
+bool ResolveWgcCaptureBounds(int targetW, int targetH, RECT& outCaptureBounds);
 void UpdateScalerCB(
     float sourceW, float sourceH,
     float sourceOffsetX, float sourceOffsetY,
@@ -312,6 +355,37 @@ void CALLBACK FocusWinEventProc(
     }
 }
 
+// WinEventProc for Target Window Location Changes (moves, resizes)
+void CALLBACK LocationWinEventProc(
+    HWINEVENTHOOK hWinEventHook,
+    DWORD event,
+    HWND hWnd,
+    LONG idObject,
+    LONG idChild,
+    DWORD idEventThread,
+    DWORD dwmsEventTime)
+{
+    UNREFERENCED_PARAMETER(hWinEventHook);
+    UNREFERENCED_PARAMETER(event);
+    UNREFERENCED_PARAMETER(idChild);
+    UNREFERENCED_PARAMETER(idEventThread);
+    UNREFERENCED_PARAMETER(dwmsEventTime);
+
+    if (g_ShuttingDown.load(std::memory_order_acquire))
+    {
+        return;
+    }
+
+    if (hWnd == g_TargetHWnd && idObject == OBJID_WINDOW)
+    {
+        g_GeometryDirty.store(true, std::memory_order_release);
+        if (g_hFrameEvent)
+        {
+            SetEvent(g_hFrameEvent);
+        }
+    }
+}
+
 // Handler for GraphicsCaptureItem::Closed
 class CaptureItemClosedHandler : public ABI::Windows::Foundation::ITypedEventHandler<
     ABI::Windows::Graphics::Capture::GraphicsCaptureItem*,
@@ -428,14 +502,16 @@ void ForwardWheelEvent(UINT msg, WPARAM wParam, LPARAM lParam)
     mappedX = (std::max)(0.0f, (std::min)(mappedX, (float)(g_SourceViewW - 1)));
     mappedY = (std::max)(0.0f, (std::min)(mappedY, (float)(g_SourceViewH - 1)));
 
-    // 4. Target client coordinates (SourceView offset only; NEVER add g_ClientCaptureX/Y!)
-    int targetClientX = g_SourceViewX + (int)mappedX;
-    int targetClientY = g_SourceViewY + (int)mappedY;
-
-    // 5. Convert target client point to target screen coordinates (WM_MOUSEWHEEL expects screen coords)
-    POINT ptTargetScreen = { targetClientX, targetClientY };
-    ClientToScreen(g_TargetHWnd, &ptTargetScreen);
+    // 4. Target screen coordinates within desiredSourceRect
+    POINT ptTargetScreen = {
+        g_DesiredSourceRect.left + g_SourceViewX + (int)mappedX,
+        g_DesiredSourceRect.top  + g_SourceViewY + (int)mappedY
+    };
     LPARAM targetLParam = MAKELPARAM((SHORT)ptTargetScreen.x, (SHORT)ptTargetScreen.y);
+
+    // 5. Convert to target client coordinates for recipient resolution
+    POINT ptTargetClient = ptTargetScreen;
+    ScreenToClient(g_TargetHWnd, &ptTargetClient);
 
     // 6. Recipient resolution
     DWORD dwTargetThread = GetWindowThreadProcessId(g_TargetHWnd, NULL);
@@ -450,13 +526,13 @@ void ForwardWheelEvent(UINT msg, WPARAM wParam, LPARAM lParam)
     }
     if (!hRecipient)
     {
-        POINT ptClient = { targetClientX, targetClientY };
+        POINT ptInCur = ptTargetClient;
         HWND hCur = g_TargetHWnd;
         while (true)
         {
-            POINT ptInCur = ptClient;
-            MapWindowPoints(g_TargetHWnd, hCur, &ptInCur, 1);
-            HWND hChild = RealChildWindowFromPoint(hCur, ptInCur);
+            POINT ptChild = ptInCur;
+            MapWindowPoints(g_TargetHWnd, hCur, &ptChild, 1);
+            HWND hChild = RealChildWindowFromPoint(hCur, ptChild);
             if (!hChild || hChild == hCur) break;
             if (!(GetWindowLongPtrW(hChild, GWL_STYLE) & WS_VISIBLE)) break;
             hCur = hChild;
@@ -495,10 +571,13 @@ void ForwardMouseEvent(UINT msg, WPARAM wParam, LPARAM lParam)
         mappedX = (std::max)(0.0f, (std::min)(mappedX, (float)(g_SourceViewW - 1)));
         mappedY = (std::max)(0.0f, (std::min)(mappedY, (float)(g_SourceViewH - 1)));
 
-        int targetClientX = g_SourceViewX + (int)mappedX;
-        int targetClientY = g_SourceViewY + (int)mappedY;
+        POINT ptTargetScreen = {
+            g_DesiredSourceRect.left + g_SourceViewX + (int)mappedX,
+            g_DesiredSourceRect.top  + g_SourceViewY + (int)mappedY
+        };
 
-        POINT ptClient = { targetClientX, targetClientY };
+        POINT ptClient = ptTargetScreen;
+        ScreenToClient(g_TargetHWnd, &ptClient);
         HWND hCur = g_TargetHWnd;
         while (true)
         {
@@ -635,31 +714,165 @@ void UpdateScalerCB(
     }
 }
 
-// Geometry & Crop calculations
-void UpdateGeometry(int screenW, int screenH)
+// Resolve the real WGC capture bounds from screen-space candidates
+bool ResolveWgcCaptureBounds(int targetW, int targetH, RECT& outCaptureBounds)
 {
-    if (!IsWindow(g_TargetHWnd)) return;
+    if (!IsWindow(g_TargetHWnd)) return false;
 
+    HMONITOR hMon = MonitorFromWindow(g_TargetHWnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = { sizeof(mi) };
+    GetMonitorInfoW(hMon, &mi);
+
+    // 1. DWMWA_EXTENDED_FRAME_BOUNDS
+    RECT rcExtended = { 0 };
+    HRESULT hrExt = DwmGetWindowAttribute(g_TargetHWnd, DWMWA_EXTENDED_FRAME_BOUNDS, &rcExtended, sizeof(rcExtended));
+    if (FAILED(hrExt))
+    {
+        GetWindowRect(g_TargetHWnd, &rcExtended);
+    }
+
+    // 2. EXTENDED_FRAME_BOUNDS intersected with monitor.rcMonitor
+    RECT rcMonIntersect = { 0 };
+    bool hasMonIntersect = (IntersectRect(&rcMonIntersect, &rcExtended, &mi.rcMonitor) != 0);
+
+    // 3. Target client screen rect
     RECT rcClient = { 0 };
     GetClientRect(g_TargetHWnd, &rcClient);
-    POINT ptClient = { 0, 0 };
-    ClientToScreen(g_TargetHWnd, &ptClient);
+    RECT rcClientScreen = rcClient;
+    MapWindowPoints(g_TargetHWnd, NULL, (LPPOINT)&rcClientScreen, 2);
+
+    // 4. EXTENDED_FRAME_BOUNDS intersected with monitor.rcWork
+    RECT rcWorkIntersect = { 0 };
+    bool hasWorkIntersect = (IntersectRect(&rcWorkIntersect, &rcExtended, &mi.rcWork) != 0);
+
+    // 5. GetWindowRect (legacy fallback)
     RECT rcWindow = { 0 };
     GetWindowRect(g_TargetHWnd, &rcWindow);
 
-    g_ClientCaptureX = (ptClient.x > rcWindow.left) ? (ptClient.x - rcWindow.left) : 0;
-    g_ClientCaptureY = (ptClient.y > rcWindow.top) ? (ptClient.y - rcWindow.top) : 0;
-    g_ClientW = rcClient.right - rcClient.left;
-    g_ClientH = rcClient.bottom - rcClient.top;
-
-    if (g_ClientW <= 0 || g_ClientH <= 0)
+    struct Candidate
     {
-        g_ClientCaptureX = 0;
-        g_ClientCaptureY = 0;
-        g_ClientW = (std::max)(1, (int)(rcWindow.right - rcWindow.left));
-        g_ClientH = (std::max)(1, (int)(rcWindow.bottom - rcWindow.top));
+        RECT rect;
+        const char* name;
+        int width;
+        int height;
+        bool valid;
+    };
+
+    Candidate candidates[5] = {
+        { rcExtended, "EXTENDED_FRAME_BOUNDS", rcExtended.right - rcExtended.left, rcExtended.bottom - rcExtended.top, true },
+        { rcMonIntersect, "EXTENDED_FRAME_BOUNDS_MONITOR_CLIP", rcMonIntersect.right - rcMonIntersect.left, rcMonIntersect.bottom - rcMonIntersect.top, hasMonIntersect },
+        { rcClientScreen, "CLIENT_SCREEN_RECT", rcClientScreen.right - rcClientScreen.left, rcClientScreen.bottom - rcClientScreen.top, true },
+        { rcWorkIntersect, "EXTENDED_FRAME_BOUNDS_WORK_CLIP", rcWorkIntersect.right - rcWorkIntersect.left, rcWorkIntersect.bottom - rcWorkIntersect.top, hasWorkIntersect },
+        { rcWindow, "GET_WINDOW_RECT", rcWindow.right - rcWindow.left, rcWindow.bottom - rcWindow.top, true }
+    };
+
+    int bestIndex = -1;
+    int bestScore = 999999;
+
+    for (int i = 0; i < 5; i++)
+    {
+        if (!candidates[i].valid || candidates[i].width <= 0 || candidates[i].height <= 0)
+        {
+            continue;
+        }
+
+        int diffW = abs(candidates[i].width - targetW);
+        int diffH = abs(candidates[i].height - targetH);
+
+        // Per-axis tolerance: abs(candidateW - targetW) <= 1 && abs(candidateH - targetH) <= 1
+        if (diffW <= 1 && diffH <= 1)
+        {
+            int score = (diffW + diffH) * 10 + i;
+            if (score < bestScore)
+            {
+                bestScore = score;
+                bestIndex = i;
+            }
+        }
     }
 
+    if (bestIndex >= 0)
+    {
+        outCaptureBounds = candidates[bestIndex].rect;
+        return true;
+    }
+
+    ScalerLog("Warning: No WGC capture candidate matched target size (%d,%d) within 1px tolerance!\n", targetW, targetH);
+    for (int i = 0; i < 5; i++)
+    {
+        ScalerLog("  Candidate [%d] %s: [%ld,%ld,%ld,%ld] (w=%d, h=%d)\n",
+            i, candidates[i].name,
+            candidates[i].rect.left, candidates[i].rect.top, candidates[i].rect.right, candidates[i].rect.bottom,
+            candidates[i].width, candidates[i].height);
+    }
+
+    outCaptureBounds = candidates[0].rect;
+    return false;
+}
+
+// Geometry & Crop calculations
+void UpdateGeometry(int screenW, int screenH, int captureW, int captureH)
+{
+    if (!IsWindow(g_TargetHWnd)) return;
+
+    // 1. Resolve WGC Capture Bounds
+    ResolveWgcCaptureBounds(captureW, captureH, g_CaptureBounds);
+
+    // 2. Query Extended Frame Bounds
+    RECT rcExtended = { 0 };
+    HRESULT hrExt = DwmGetWindowAttribute(g_TargetHWnd, DWMWA_EXTENDED_FRAME_BOUNDS, &rcExtended, sizeof(rcExtended));
+    if (FAILED(hrExt))
+    {
+        rcExtended = g_CaptureBounds;
+    }
+
+    // 3. Query Optional Visible Frame Border Thickness (default 0 on failure)
+    UINT borderThickness = 0;
+    HRESULT hrThick = DwmGetWindowAttribute(g_TargetHWnd, DWMWA_VISIBLE_FRAME_BORDER_THICKNESS, &borderThickness, sizeof(borderThickness));
+    if (FAILED(hrThick))
+    {
+        borderThickness = 0;
+    }
+
+    // 4. Query DWM NC Rendering Enabled for diagnostic logging
+    BOOL ncRenderingEnabled = FALSE;
+    DwmGetWindowAttribute(g_TargetHWnd, DWMWA_NCRENDERING_ENABLED, &ncRenderingEnabled, sizeof(ncRenderingEnabled));
+
+    // 5. Inset extended frame bounds by visible frame border thickness
+    RECT innerFrame = rcExtended;
+    innerFrame.left += borderThickness;
+    innerFrame.top += borderThickness;
+    innerFrame.right -= borderThickness;
+    innerFrame.bottom -= borderThickness;
+
+    // 6. Target Client Rect in Screen Coordinates
+    RECT rcClient = { 0 };
+    GetClientRect(g_TargetHWnd, &rcClient);
+    RECT rcClientScreen = rcClient;
+    MapWindowPoints(g_TargetHWnd, NULL, (LPPOINT)&rcClientScreen, 2);
+
+    // 7. desiredSourceRect = intersection(clientScreenRect, innerFrame)
+    if (!IntersectRect(&g_DesiredSourceRect, &rcClientScreen, &innerFrame))
+    {
+        g_DesiredSourceRect = rcClientScreen;
+    }
+
+    if (g_DesiredSourceRect.right <= g_DesiredSourceRect.left ||
+        g_DesiredSourceRect.bottom <= g_DesiredSourceRect.top)
+    {
+        g_DesiredSourceRect = rcClientScreen;
+    }
+
+    // 8. Final GPU Crop parameters (in WGC texture space)
+    g_CropOffsetX = g_DesiredSourceRect.left - g_CaptureBounds.left;
+    g_CropOffsetY = g_DesiredSourceRect.top  - g_CaptureBounds.top;
+    g_CropSizeW   = g_DesiredSourceRect.right - g_DesiredSourceRect.left;
+    g_CropSizeH   = g_DesiredSourceRect.bottom - g_DesiredSourceRect.top;
+
+    g_ClientW = (std::max)(1, g_CropSizeW);
+    g_ClientH = (std::max)(1, g_CropSizeH);
+
+    // 9. Viewport and Source View calculation
     if (g_FilterId == MT_SCALER_FILTER_PIXEL_PERFECT)
     {
         if (g_ClientW > screenW || g_ClientH > screenH)
@@ -735,6 +948,38 @@ void UpdateGeometry(int screenW, int screenH)
         g_SourceViewW = g_ClientW;
         g_SourceViewH = g_ClientH;
     }
+
+    // 10. One-Time Diagnostic Logging
+    RECT rcWindow = { 0 };
+    GetWindowRect(g_TargetHWnd, &rcWindow);
+
+    ScalerLog("Geometry Updated:\n"
+        "  GetWindowRect:               [%ld, %ld, %ld, %ld] (w=%ld, h=%ld)\n"
+        "  ExtendedFrameBounds:         [%ld, %ld, %ld, %ld] (w=%ld, h=%ld)\n"
+        "  ClientScreenRect:            [%ld, %ld, %ld, %ld] (w=%ld, h=%ld)\n"
+        "  VisibleFrameBorderThickness: %u\n"
+        "  NCRenderingEnabled:          %d\n"
+        "  GraphicsCaptureItem.Size:    [%d, %d]\n"
+        "  CaptureTargetSize:           [%d, %d]\n"
+        "  ContentSize:                 [%d, %d]\n"
+        "  ResolvedCaptureBounds:       [%ld, %ld, %ld, %ld] (w=%ld, h=%ld)\n"
+        "  DesiredSourceRect:           [%ld, %ld, %ld, %ld] (w=%ld, h=%ld)\n"
+        "  Final SourceOffset:          [%d, %d]\n"
+        "  Final SourceSize:            [%d, %d]\n"
+        "  Viewport:                    [%d, %d, %d, %d], SourceView: [%d, %d, %d, %d]\n",
+        rcWindow.left, rcWindow.top, rcWindow.right, rcWindow.bottom, rcWindow.right - rcWindow.left, rcWindow.bottom - rcWindow.top,
+        rcExtended.left, rcExtended.top, rcExtended.right, rcExtended.bottom, rcExtended.right - rcExtended.left, rcExtended.bottom - rcExtended.top,
+        rcClientScreen.left, rcClientScreen.top, rcClientScreen.right, rcClientScreen.bottom, rcClientScreen.right - rcClientScreen.left, rcClientScreen.bottom - rcClientScreen.top,
+        borderThickness,
+        (int)ncRenderingEnabled,
+        g_CaptureItemSize.Width, g_CaptureItemSize.Height,
+        captureW, captureH,
+        g_CachedContentSize.Width, g_CachedContentSize.Height,
+        g_CaptureBounds.left, g_CaptureBounds.top, g_CaptureBounds.right, g_CaptureBounds.bottom, g_CaptureBounds.right - g_CaptureBounds.left, g_CaptureBounds.bottom - g_CaptureBounds.top,
+        g_DesiredSourceRect.left, g_DesiredSourceRect.top, g_DesiredSourceRect.right, g_DesiredSourceRect.bottom, g_DesiredSourceRect.right - g_DesiredSourceRect.left, g_DesiredSourceRect.bottom - g_DesiredSourceRect.top,
+        g_CropOffsetX, g_CropOffsetY,
+        g_CropSizeW, g_CropSizeH,
+        g_VpX, g_VpY, g_VpW, g_VpH, g_SourceViewX, g_SourceViewY, g_SourceViewW, g_SourceViewH);
 }
 
 // Preallocate FSR intermediate texture
@@ -899,6 +1144,30 @@ void RenderFrame()
         return;
     }
 
+    // Check for ContentSize changes
+    ABI::Windows::Graphics::SizeInt32 contentSize = { 0, 0 };
+    if (SUCCEEDED(frame->get_ContentSize(&contentSize)))
+    {
+        if (contentSize.Width > 0 && contentSize.Height > 0 &&
+            (contentSize.Width != g_CachedContentSize.Width || contentSize.Height != g_CachedContentSize.Height))
+        {
+            ScalerLog("ContentSize changed: [%d, %d] -> [%d, %d]. Recreating frame pool.\n",
+                g_CachedContentSize.Width, g_CachedContentSize.Height,
+                contentSize.Width, contentSize.Height);
+
+            g_CachedContentSize = contentSize;
+            if (g_pFramePool && g_pDirect3DDevice)
+            {
+                g_pFramePool->Recreate(
+                    g_pDirect3DDevice,
+                    ABI::Windows::Graphics::DirectX::DirectXPixelFormat_B8G8R8A8UIntNormalized,
+                    2,
+                    contentSize);
+            }
+            g_GeometryDirty.store(true, std::memory_order_release);
+        }
+    }
+
     Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess* dxgiAccess = nullptr;
     hr = surface->QueryInterface(IID_PPV_ARGS(&dxgiAccess));
     if (FAILED(hr) || !dxgiAccess)
@@ -928,7 +1197,25 @@ void RenderFrame()
     int screenW = (int)scDesc.Width;
     int screenH = (int)scDesc.Height;
 
-    UpdateGeometry(screenW, screenH);
+    if (g_GeometryDirty.exchange(false, std::memory_order_acq_rel))
+    {
+        int targetW = (g_CachedContentSize.Width > 0) ? g_CachedContentSize.Width : (int)texDesc.Width;
+        int targetH = (g_CachedContentSize.Height > 0) ? g_CachedContentSize.Height : (int)texDesc.Height;
+        UpdateGeometry(screenW, screenH, targetW, targetH);
+    }
+
+    // Invariant Check
+    if (g_CropOffsetX < 0 || g_CropOffsetY < 0 ||
+        g_CropOffsetX + g_CropSizeW > (int)texDesc.Width ||
+        g_CropOffsetY + g_CropSizeH > (int)texDesc.Height ||
+        g_CropSizeW <= 0 || g_CropSizeH <= 0)
+    {
+        ScalerLog("Crop invariant violation! Offset=[%d, %d], Size=[%d, %d], Tex=[%u, %u]\n",
+            g_CropOffsetX, g_CropOffsetY, g_CropSizeW, g_CropSizeH, texDesc.Width, texDesc.Height);
+        capturedTexture->Release();
+        frame->Release();
+        return;
+    }
 
     // Create SRV for captured texture
     ID3D11ShaderResourceView* pCapturedSRV = nullptr;
@@ -943,7 +1230,7 @@ void RenderFrame()
         // Update Constant Buffer
         UpdateScalerCB(
             (float)g_SourceViewW, (float)g_SourceViewH,
-            (float)(g_ClientCaptureX + g_SourceViewX), (float)(g_ClientCaptureY + g_SourceViewY),
+            (float)(g_CropOffsetX + g_SourceViewX), (float)(g_CropOffsetY + g_SourceViewY),
             (float)texDesc.Width, (float)texDesc.Height,
             (float)g_VpW, (float)g_VpH,
             (float)g_VpX, (float)g_VpY);
@@ -1014,7 +1301,7 @@ void RenderFrame()
                 // Pass 1: EASU
                 UpdateScalerCB(
                     (float)g_SourceViewW, (float)g_SourceViewH,
-                    (float)(g_ClientCaptureX + g_SourceViewX), (float)(g_ClientCaptureY + g_SourceViewY),
+                    (float)(g_CropOffsetX + g_SourceViewX), (float)(g_CropOffsetY + g_SourceViewY),
                     (float)texDesc.Width, (float)texDesc.Height,
                     (float)g_VpW, (float)g_VpH,
                     0.0f, 0.0f);
@@ -1056,7 +1343,7 @@ void RenderFrame()
                 {
                     UpdateScalerCB(
                         (float)g_SourceViewW, (float)g_SourceViewH,
-                        (float)(g_ClientCaptureX + g_SourceViewX), (float)(g_ClientCaptureY + g_SourceViewY),
+                        (float)(g_CropOffsetX + g_SourceViewX), (float)(g_CropOffsetY + g_SourceViewY),
                         (float)texDesc.Width, (float)texDesc.Height,
                         (float)g_VpW, (float)g_VpH,
                         (float)g_VpX, (float)g_VpY);
@@ -1072,7 +1359,7 @@ void RenderFrame()
                 {
                     UpdateScalerCB(
                         (float)g_SourceViewW, (float)g_SourceViewH,
-                        (float)(g_ClientCaptureX + g_SourceViewX), (float)(g_ClientCaptureY + g_SourceViewY),
+                        (float)(g_CropOffsetX + g_SourceViewX), (float)(g_CropOffsetY + g_SourceViewY),
                         (float)texDesc.Width, (float)texDesc.Height,
                         (float)g_SourceViewW, (float)g_SourceViewH,
                         0.0f, 0.0f);
@@ -1102,7 +1389,7 @@ void RenderFrame()
                 {
                     UpdateScalerCB(
                         (float)g_SourceViewW, (float)g_SourceViewH,
-                        (float)(g_ClientCaptureX + g_SourceViewX), (float)(g_ClientCaptureY + g_SourceViewY),
+                        (float)(g_CropOffsetX + g_SourceViewX), (float)(g_CropOffsetY + g_SourceViewY),
                         (float)texDesc.Width, (float)texDesc.Height,
                         (float)g_SourceViewW, (float)g_SourceViewH,
                         0.0f, 0.0f);
@@ -1147,7 +1434,7 @@ void RenderFrame()
                     // Pass 1
                     UpdateScalerCB(
                         (float)g_SourceViewW, (float)g_SourceViewH,
-                        (float)(g_ClientCaptureX + g_SourceViewX), (float)(g_ClientCaptureY + g_SourceViewY),
+                        (float)(g_CropOffsetX + g_SourceViewX), (float)(g_CropOffsetY + g_SourceViewY),
                         (float)texDesc.Width, (float)texDesc.Height,
                         (float)g_SourceViewW, (float)g_SourceViewH,
                         0.0f, 0.0f);
@@ -1177,7 +1464,7 @@ void RenderFrame()
                     // Pass 3 (2x Output)
                     UpdateScalerCB(
                         (float)g_SourceViewW, (float)g_SourceViewH,
-                        (float)(g_ClientCaptureX + g_SourceViewX), (float)(g_ClientCaptureY + g_SourceViewY),
+                        (float)(g_CropOffsetX + g_SourceViewX), (float)(g_CropOffsetY + g_SourceViewY),
                         (float)texDesc.Width, (float)texDesc.Height,
                         (float)(g_SourceViewW * 2), (float)(g_SourceViewH * 2),
                         0.0f, 0.0f);
@@ -1243,7 +1530,7 @@ void ShutdownScaler()
 
     ScalerLog("ShutdownScaler starting...\n");
 
-    // 1. Unhook focus and minimize hooks
+    // 1. Unhook focus, minimize, and location hooks
     if (g_hForegroundHook)
     {
         UnhookWinEvent(g_hForegroundHook);
@@ -1253,6 +1540,11 @@ void ShutdownScaler()
     {
         UnhookWinEvent(g_hMinimizeHook);
         g_hMinimizeHook = NULL;
+    }
+    if (g_hLocationHook)
+    {
+        UnhookWinEvent(g_hLocationHook);
+        g_hLocationHook = NULL;
     }
 
     // 2. Unsubscribe FrameArrived
@@ -1301,10 +1593,20 @@ void ShutdownScaler()
         g_pFramePool = nullptr;
     }
 
-    // 5. Remove UI property from target window
+    // 5. Remove UI property from target window and restore corner preference
     if (g_TargetHWnd && IsWindow(g_TargetHWnd))
     {
         RemovePropW(g_TargetHWnd, MT_PROP_SCALED);
+
+        if (g_HasTargetCornerPref)
+        {
+            DWORD actualPid = 0;
+            if (GetWindowThreadProcessId(g_TargetHWnd, &actualPid) && actualPid == g_TargetPid)
+            {
+                DwmSetWindowAttribute(g_TargetHWnd, DWMWA_WINDOW_CORNER_PREFERENCE, &g_PrevTargetCornerPref, sizeof(g_PrevTargetCornerPref));
+            }
+            g_HasTargetCornerPref = false;
+        }
     }
 
     // 6. Release intermediate resources
@@ -1338,7 +1640,12 @@ void ShutdownScaler()
     if (g_pAnime4K_3D_AA_P3) { g_pAnime4K_3D_AA_P3->Release(); g_pAnime4K_3D_AA_P3 = nullptr; }
     if (g_pAnime4K_Final) { g_pAnime4K_Final->Release(); g_pAnime4K_Final = nullptr; }
 
-    // 8. Release D3D11 core resources
+    // 8. Release WinRT device & D3D11 core resources
+    if (g_pDirect3DDevice)
+    {
+        g_pDirect3DDevice->Release();
+        g_pDirect3DDevice = nullptr;
+    }
     if (g_pPointSampler) { g_pPointSampler->Release(); g_pPointSampler = nullptr; }
     if (g_pLinearSampler) { g_pLinearSampler->Release(); g_pLinearSampler = nullptr; }
     if (g_pConstantBuffer) { g_pConstantBuffer->Release(); g_pConstantBuffer = nullptr; }
@@ -1362,6 +1669,7 @@ void ShutdownScaler()
     // 10. Close Sync Objects
     if (g_hFrameEvent) { CloseHandle(g_hFrameEvent); g_hFrameEvent = NULL; }
     if (g_hExitEvent) { CloseHandle(g_hExitEvent); g_hExitEvent = NULL; }
+    if (g_hTargetProcess) { CloseHandle(g_hTargetProcess); g_hTargetProcess = NULL; }
     if (g_hActiveMutex)
     {
         CloseHandle(g_hActiveMutex);
@@ -1424,12 +1732,35 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
         return 1;
     }
 
+    // Open target process handle for exit wait & synchronization
+    g_hTargetProcess = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, g_TargetPid);
+    if (!g_hTargetProcess)
+    {
+        ScalerLog("OpenProcess for target PID %lu failed: %lu\n", g_TargetPid, GetLastError());
+    }
+
     // Integrity Level Check (UIPI)
     if (!CheckIntegrityLevel(g_TargetPid))
     {
         MessageBoxW(NULL, L"Cannot scale a target window with a higher Integrity Level (Administrator).", L"MenuTools Scaler", MB_ICONWARNING | MB_OK);
         return 1;
     }
+
+    // Save and configure target window corner preference BEFORE querying geometry / capture item size
+    DWORD prevCorner = DWMWCP_DEFAULT;
+    HRESULT hrCorner = DwmGetWindowAttribute(g_TargetHWnd, DWMWA_WINDOW_CORNER_PREFERENCE, &prevCorner, sizeof(prevCorner));
+    if (SUCCEEDED(hrCorner))
+    {
+        g_PrevTargetCornerPref = prevCorner;
+    }
+    else
+    {
+        g_PrevTargetCornerPref = DWMWCP_DEFAULT;
+    }
+    g_HasTargetCornerPref = true;
+
+    DWORD noRound = DWMWCP_DONOTROUND;
+    DwmSetWindowAttribute(g_TargetHWnd, DWMWA_WINDOW_CORNER_PREFERENCE, &noRound, sizeof(noRound));
 
     // Mutex as existence-marker: Scaler owns the mutex throughout execution
     g_hActiveMutex = CreateMutexW(nullptr, FALSE, MT_SCALER_MUTEX_NAME);
@@ -1507,6 +1838,12 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
         ShutdownScaler();
         return 1;
     }
+
+    // Configure overlay window: do not round corners and remove any DWM border
+    DWORD overlayNoRound = DWMWCP_DONOTROUND;
+    DwmSetWindowAttribute(g_ScalerHWnd, DWMWA_WINDOW_CORNER_PREFERENCE, &overlayNoRound, sizeof(overlayNoRound));
+    COLORREF noBorderColor = DWMWA_COLOR_NONE;
+    DwmSetWindowAttribute(g_ScalerHWnd, DWMWA_BORDER_COLOR, &noBorderColor, sizeof(noBorderColor));
 
     // Initialize Direct3D 11 (try debug layer first, fallback to standard)
     D3D_FEATURE_LEVEL featureLevels[] = { D3D_FEATURE_LEVEL_11_0 };
@@ -1661,30 +1998,6 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
         return 1;
     }
 
-    // Compute geometry and preallocate intermediate textures BEFORE WGC session
-    UpdateGeometry(screenW, screenH);
-
-    if (g_FilterId == MT_SCALER_FILTER_FSR)
-    {
-        if (!EnsureFSRIntermediate((UINT)g_VpW, (UINT)g_VpH))
-        {
-            ScalerLog("Preallocation of FSR intermediate textures failed!\n");
-            dxgiDevice->Release();
-            ShutdownScaler();
-            return 1;
-        }
-    }
-    else if (g_FilterId == MT_SCALER_FILTER_ANIME4K_3D || g_FilterId == MT_SCALER_FILTER_ANIME4K_3D_AA)
-    {
-        if (!EnsureAnime4KIntermediates((UINT)g_SourceViewW, (UINT)g_SourceViewH))
-        {
-            ScalerLog("Preallocation of Anime4K intermediate textures failed!\n");
-            dxgiDevice->Release();
-            ShutdownScaler();
-            return 1;
-        }
-    }
-
     // Wrap Direct3D 11 device into WinRT IDirect3DDevice
     IInspectable* inspectableDevice = nullptr;
     HMODULE hD3D11 = GetModuleHandleW(L"d3d11.dll");
@@ -1693,7 +2006,13 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     pfnCreateD3DDevice(dxgiDevice, &inspectableDevice);
     dxgiDevice->Release();
 
-    auto direct3dDevice = (ABI::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice*)inspectableDevice;
+    g_pDirect3DDevice = (ABI::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice*)inspectableDevice;
+    if (!g_pDirect3DDevice)
+    {
+        ScalerLog("CreateDirect3D11DeviceFromDXGIDevice failed\n");
+        ShutdownScaler();
+        return 1;
+    }
 
     // Create GraphicsCaptureItem for target window
     HSTRING hstrItem;
@@ -1708,7 +2027,6 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     if (!g_pCaptureItem)
     {
         ScalerLog("CreateForWindow failed\n");
-        direct3dDevice->Release();
         ShutdownScaler();
         return 1;
     }
@@ -1722,8 +2040,30 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
         g_CaptureItemClosedSubscribed = true;
     }
 
-    ABI::Windows::Graphics::SizeInt32 itemSize;
-    g_pCaptureItem->get_Size(&itemSize);
+    g_pCaptureItem->get_Size(&g_CaptureItemSize);
+    g_CachedContentSize = g_CaptureItemSize;
+
+    // Compute geometry and preallocate intermediate textures BEFORE WGC session
+    UpdateGeometry(screenW, screenH, g_CaptureItemSize.Width, g_CaptureItemSize.Height);
+
+    if (g_FilterId == MT_SCALER_FILTER_FSR)
+    {
+        if (!EnsureFSRIntermediate((UINT)g_VpW, (UINT)g_VpH))
+        {
+            ScalerLog("Preallocation of FSR intermediate textures failed!\n");
+            ShutdownScaler();
+            return 1;
+        }
+    }
+    else if (g_FilterId == MT_SCALER_FILTER_ANIME4K_3D || g_FilterId == MT_SCALER_FILTER_ANIME4K_3D_AA)
+    {
+        if (!EnsureAnime4KIntermediates((UINT)g_SourceViewW, (UINT)g_SourceViewH))
+        {
+            ScalerLog("Preallocation of Anime4K intermediate textures failed!\n");
+            ShutdownScaler();
+            return 1;
+        }
+    }
 
     // Create Direct3D11CaptureFramePool
     HSTRING hstrPool;
@@ -1735,14 +2075,13 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     if (poolStatics2)
     {
         poolStatics2->CreateFreeThreaded(
-            direct3dDevice,
+            g_pDirect3DDevice,
             ABI::Windows::Graphics::DirectX::DirectXPixelFormat_B8G8R8A8UIntNormalized,
             2,
-            itemSize,
+            g_CaptureItemSize,
             &g_pFramePool);
         poolStatics2->Release();
     }
-    direct3dDevice->Release();
 
     if (!g_pFramePool)
     {
@@ -1792,6 +2131,12 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
         NULL, FocusWinEventProc,
         0, 0, WINEVENT_OUTOFCONTEXT);
 
+    // Hook target window location changes (moves, resizes) specifically for g_TargetPid
+    g_hLocationHook = SetWinEventHook(
+        EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE,
+        NULL, LocationWinEventProc,
+        g_TargetPid, 0, WINEVENT_OUTOFCONTEXT);
+
     // Mark target as scaled (UI marker only)
     SetPropW(g_TargetHWnd, MT_PROP_SCALED, (HANDLE)1);
 
@@ -1807,20 +2152,31 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     ScalerLog("Scaler initialized successfully and capture active.\n");
 
     // Main Message & Render Loop
-    HANDLE waitHandles[] = { g_hFrameEvent, g_hExitEvent };
+    HANDLE waitHandles[3] = { g_hFrameEvent, g_hExitEvent, NULL };
+    DWORD handleCount = 2;
+    if (g_hTargetProcess)
+    {
+        waitHandles[2] = g_hTargetProcess;
+        handleCount = 3;
+    }
 
     while (g_Running && !g_ShuttingDown.load(std::memory_order_acquire))
     {
-        DWORD waitRes = MsgWaitForMultipleObjectsEx(2, waitHandles, 50, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        DWORD waitRes = MsgWaitForMultipleObjectsEx(handleCount, waitHandles, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
 
         if (waitRes == WAIT_OBJECT_0)
         {
-            // Frame arrived!
+            // Frame arrived (or location change triggered)
             RenderFrame();
         }
         else if (waitRes == WAIT_OBJECT_0 + 1)
         {
             ScalerLog("Exit event signaled, terminating loop.\n");
+            break;
+        }
+        else if (handleCount == 3 && waitRes == WAIT_OBJECT_0 + 2)
+        {
+            ScalerLog("Target process terminated, terminating loop.\n");
             break;
         }
 
