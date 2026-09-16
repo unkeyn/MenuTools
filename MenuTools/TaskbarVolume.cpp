@@ -718,14 +718,46 @@ namespace TaskbarVolume
 			DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
 			CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
 
-		// Create hidden OSD window
-		g_hOsdWnd = CreateWindowExW(
-			WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
-			L"MenuTools_OSD",
-			L"",
-			WS_POPUP,
-			0, 0, 56, 26,
-			NULL, NULL, GetModuleHandleW(NULL), NULL);
+		// Create hidden OSD window in ZBID_SYSTEM_TOOLS (Band 16).
+		// On Windows 10/11, standard windows (Band 1) are rendered below immersive Shell
+		// Taskbar and Thumbnail Previews (Band 11). Band 16 places the OSD strictly above
+		// all Shell taskbar previews and flyouts without stealing focus.
+		typedef HWND (WINAPI *CreateWindowInBand_t)(
+			DWORD dwExStyle,
+			LPCWSTR lpClassName,
+			LPCWSTR lpWindowName,
+			DWORD dwStyle,
+			int X, int Y, int nWidth, int nHeight,
+			HWND hWndParent,
+			HMENU hMenu,
+			HINSTANCE hInstance,
+			LPVOID lpParam,
+			DWORD dwBand);
+		static auto pfnCreateWindowInBand = (CreateWindowInBand_t)GetProcAddress(
+			GetModuleHandleW(L"user32.dll"), "CreateWindowInBand");
+
+		if (pfnCreateWindowInBand)
+		{
+			g_hOsdWnd = pfnCreateWindowInBand(
+				WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+				L"MenuTools_OSD",
+				L"",
+				WS_POPUP,
+				0, 0, 56, 26,
+				NULL, NULL, GetModuleHandleW(NULL), NULL,
+				16 /* ZBID_SYSTEM_TOOLS */);
+		}
+
+		if (!g_hOsdWnd)
+		{
+			g_hOsdWnd = CreateWindowExW(
+				WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+				L"MenuTools_OSD",
+				L"",
+				WS_POPUP,
+				0, 0, 56, 26,
+				NULL, NULL, GetModuleHandleW(NULL), NULL);
+		}
 
 		// Install low-level mouse hook
 		g_hMouseHook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, GetModuleHandleW(NULL), 0);
