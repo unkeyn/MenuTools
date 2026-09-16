@@ -305,6 +305,7 @@ BOOL MenuTools::Install(HWND hWnd)
 	{
 		HMENU hSubMenu = CreatePopupMenu();
 		AppendMenu(hSubMenu, MF_STRING, MT_MENU_FULLSCREEN_NEAREST, _T("Nearest Neighbor"));
+		AppendMenu(hSubMenu, MF_STRING, MT_MENU_FULLSCREEN_PIXEL_PERFECT, _T("Pixel Perfect"));
 		AppendMenu(hSubMenu, MF_STRING, MT_MENU_FULLSCREEN_BICUBIC, _T("Bicubic"));
 		AppendMenu(hSubMenu, MF_STRING, MT_MENU_FULLSCREEN_LANCZOS, _T("Lanczos"));
 		AppendMenu(hSubMenu, MF_STRING, MT_MENU_FULLSCREEN_FSR, _T("FSR"));
@@ -431,27 +432,37 @@ VOID MenuTools::Status(HWND hWnd)
 			DWORD filterId = GetScalerRegDword(L"ScalerFilter", MT_SCALER_FILTER_BICUBIC);
 			DWORD preserveAspect = GetScalerRegDword(L"PreserveAspect", 1);
 
-			if (filterId > MT_SCALER_FILTER_NEAREST)
+			if (filterId > MT_SCALER_FILTER_PIXEL_PERFECT)
 			{
 				filterId = MT_SCALER_FILTER_BICUBIC;
 			}
 
-			UINT radioPos = 1;
+			UINT radioPos = 2;
 			switch (filterId)
 			{
 			case MT_SCALER_FILTER_NEAREST: radioPos = 0; break;
-			case MT_SCALER_FILTER_BICUBIC: radioPos = 1; break;
-			case MT_SCALER_FILTER_LANCZOS: radioPos = 2; break;
-			case MT_SCALER_FILTER_FSR: radioPos = 3; break;
-			case MT_SCALER_FILTER_ANIME4K_3D: radioPos = 4; break;
-			case MT_SCALER_FILTER_ANIME4K_3D_AA: radioPos = 5; break;
-			default: radioPos = 1; break;
+			case MT_SCALER_FILTER_PIXEL_PERFECT: radioPos = 1; break;
+			case MT_SCALER_FILTER_BICUBIC: radioPos = 2; break;
+			case MT_SCALER_FILTER_LANCZOS: radioPos = 3; break;
+			case MT_SCALER_FILTER_FSR: radioPos = 4; break;
+			case MT_SCALER_FILTER_ANIME4K_3D: radioPos = 5; break;
+			case MT_SCALER_FILTER_ANIME4K_3D_AA: radioPos = 6; break;
+			default: radioPos = 2; break;
 			}
 
-			CheckMenuRadioItem(hSub, 0, 5, radioPos, MF_BYPOSITION);
+			CheckMenuRadioItem(hSub, 0, 6, radioPos, MF_BYPOSITION);
 
-			CheckMenuItem(hSub, MT_MENU_FULLSCREEN_ASPECT_RATIO,
-				MF_BYCOMMAND | (preserveAspect ? MF_CHECKED : MF_UNCHECKED));
+			if (filterId == MT_SCALER_FILTER_PIXEL_PERFECT)
+			{
+				CheckMenuItem(hSub, MT_MENU_FULLSCREEN_ASPECT_RATIO, MF_BYCOMMAND | MF_CHECKED);
+				EnableMenuItem(hSub, MT_MENU_FULLSCREEN_ASPECT_RATIO, MF_BYCOMMAND | MF_GRAYED);
+			}
+			else
+			{
+				EnableMenuItem(hSub, MT_MENU_FULLSCREEN_ASPECT_RATIO, MF_BYCOMMAND | MF_ENABLED);
+				CheckMenuItem(hSub, MT_MENU_FULLSCREEN_ASPECT_RATIO,
+					MF_BYCOMMAND | (preserveAspect ? MF_CHECKED : MF_UNCHECKED));
+			}
 
 			BOOL isScaled = (GetProp(hWnd, MT_PROP_SCALED) != NULL);
 			if (isScaled)
@@ -573,6 +584,7 @@ BOOL MenuTools::WndProc(HWND hWnd, WPARAM wParam, LPARAM lParam)
 		return TRUE;
 	}
 	case MT_MENU_FULLSCREEN_NEAREST:
+	case MT_MENU_FULLSCREEN_PIXEL_PERFECT:
 	case MT_MENU_FULLSCREEN_BICUBIC:
 	case MT_MENU_FULLSCREEN_LANCZOS:
 	case MT_MENU_FULLSCREEN_FSR:
@@ -584,6 +596,9 @@ BOOL MenuTools::WndProc(HWND hWnd, WPARAM wParam, LPARAM lParam)
 		{
 		case MT_MENU_FULLSCREEN_NEAREST:
 			filter = MT_SCALER_FILTER_NEAREST;
+			break;
+		case MT_MENU_FULLSCREEN_PIXEL_PERFECT:
+			filter = MT_SCALER_FILTER_PIXEL_PERFECT;
 			break;
 		case MT_MENU_FULLSCREEN_BICUBIC:
 			filter = MT_SCALER_FILTER_BICUBIC;
@@ -613,6 +628,13 @@ BOOL MenuTools::WndProc(HWND hWnd, WPARAM wParam, LPARAM lParam)
 	}
 	case MT_MENU_FULLSCREEN_ASPECT_RATIO:
 	{
+		DWORD filterId = GetScalerRegDword(L"ScalerFilter", MT_SCALER_FILTER_BICUBIC);
+		if (filterId == MT_SCALER_FILTER_PIXEL_PERFECT)
+		{
+			// Pixel Perfect always preserves aspect ratio; do not toggle
+			return TRUE;
+		}
+
 		DWORD preserveAspect = GetScalerRegDword(L"PreserveAspect", 1);
 		preserveAspect = preserveAspect ? 0 : 1;
 		SetScalerRegDword(L"PreserveAspect", preserveAspect);

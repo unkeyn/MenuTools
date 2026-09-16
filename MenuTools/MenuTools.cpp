@@ -123,6 +123,10 @@ static void StartScaler(HWND targetHWnd)
 	if (!targetPid) return;
 
 	DWORD filterId = GetScalerRegDword(L"ScalerFilter", MT_SCALER_FILTER_BICUBIC);
+	if (filterId > MT_SCALER_FILTER_PIXEL_PERFECT)
+	{
+		filterId = MT_SCALER_FILTER_BICUBIC;
+	}
 	DWORD preserveAspect = GetScalerRegDword(L"PreserveAspect", 1);
 
 	wchar_t szExeDir[MAX_PATH];
@@ -193,6 +197,17 @@ UINT uTrayId;
 ATOM				MyRegisterClass(HINSTANCE hInstance);
 BOOL				InitInstance(HINSTANCE, int);
 LRESULT CALLBACK	WndProc(HWND, UINT, WPARAM, LPARAM);
+static void MTLog(const wchar_t* fmt, ...)
+{
+	FILE* f = _wfopen(L"C:\\Program Files\\MenuTools\\mt_debug.log", L"a");
+	if (!f) return;
+	va_list args;
+	va_start(args, fmt);
+	vfwprintf(f, fmt, args);
+	va_end(args);
+	fclose(f);
+}
+
 INT_PTR CALLBACK	About(HWND, UINT, WPARAM, LPARAM);
 
 int APIENTRY _tWinMain(_In_ HINSTANCE hInstance,
@@ -204,34 +219,44 @@ int APIENTRY _tWinMain(_In_ HINSTANCE hInstance,
 	UNREFERENCED_PARAMETER(lpCmdLine);
 	UNREFERENCED_PARAMETER(nCmdShow);
 
+	MTLog(L"[%d] _tWinMain started (PID %lu)\n", (int)(sizeof(void*) * 8), GetCurrentProcessId());
+
 	Startup startup;
 	// Command line arguments
 	if (!startup.ParseFlags(GetCommandLineW()))
 	{
+		MTLog(L"[%d] ParseFlags failed\n", (int)(sizeof(void*) * 8));
 		return FALSE;
 	}
 
 	// Single instance
 	if (!startup.CreateJob())
 	{
+		MTLog(L"[%d] CreateJob failed (LastError=%lu)\n", (int)(sizeof(void*) * 8), GetLastError());
 		return FALSE;
 	}
+	MTLog(L"[%d] CreateJob succeeded\n", (int)(sizeof(void*) * 8));
 
 	// Initialize global strings
 #ifdef _WIN64
 	LoadString(hInstance, IDS_APP_TITLE64, szTitle, MAX_LOADSTRING);
+	if (szTitle[0] == 0) lstrcpyW(szTitle, L"MenuTools x64");
 	lstrcpyW(szWindowClass, L"MENUTOOLS64");
 #else
 	LoadString(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
+	if (szTitle[0] == 0) lstrcpyW(szTitle, L"MenuTools");
 	LoadString(hInstance, IDC_MENUTOOLS, szWindowClass, MAX_LOADSTRING);
+	if (szWindowClass[0] == 0) lstrcpyW(szWindowClass, L"MENUTOOLS");
 #endif
 	MyRegisterClass(hInstance);
 
 	// Perform application initialization:
 	if (!InitInstance(hInstance, SW_HIDE))
 	{
+		MTLog(L"[%d] InitInstance failed\n", (int)(sizeof(void*) * 8));
 		return FALSE;
 	}
+	MTLog(L"[%d] InitInstance succeeded (hWnd=%p)\n", (int)(sizeof(void*) * 8), hWnd);
 
 	// Register Scaler IPC message in all instances
 	g_uMsgScaler = RegisterWindowMessageW(MT_MSG_SCALER_NAME);
@@ -268,8 +293,10 @@ int APIENTRY _tWinMain(_In_ HINSTANCE hInstance,
 	Hooks hooks;
 	if (!hooks.Install())
 	{
+		MTLog(L"[%d] hooks.Install failed\n", (int)(sizeof(void*) * 8));
 		return FALSE;
 	}
+	MTLog(L"[%d] hooks.Install succeeded\n", (int)(sizeof(void*) * 8));
 
 	// Install taskbar volume hook
 #ifdef _WIN64
@@ -281,6 +308,7 @@ int APIENTRY _tWinMain(_In_ HINSTANCE hInstance,
 		TaskbarVolume::Install(hWnd);
 	}
 #endif
+	MTLog(L"[%d] Entering message loop\n", (int)(sizeof(void*) * 8));
 
 	// Main message loop:
 	MSG msg;
@@ -289,6 +317,7 @@ int APIENTRY _tWinMain(_In_ HINSTANCE hInstance,
 		TranslateMessage(&msg);
 		DispatchMessage(&msg);
 	}
+	MTLog(L"[%d] Exited message loop (msg.wParam=%lld)\n", (int)(sizeof(void*) * 8), (long long)msg.wParam);
 
 	TaskbarVolume::Uninstall();
 	if (IsScalerManager())

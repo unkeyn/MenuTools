@@ -13,12 +13,13 @@
   - Standalone, on-demand GPU scaler process (`MenuToolsScaler.exe`) powered by **Windows Graphics Capture (WGC)** and **Direct3D 11 Compute Shaders (`cs_5_0`)**.
   - **Zero Background Overhead**: The scaler process only exists while scaling is active. Focus loss (`Alt + Tab`), window minimization, or target closure immediately terminates the scaler, releasing all GPU and capture resources.
   - **Supported Filters**:
-    - `Nearest Neighbor` (ultra-low latency 1 texel load $\rightarrow$ 1 texel write)
-    - `Bicubic`
-    - `Lanczos`
+    - `Nearest Neighbor` (ultra-low latency 1 texel load -> 1 texel write)
+    - `Pixel Perfect` (true integer scaling >= 1x, or 1:1 center-cropped if oversized, preserving pristine unblurred pixels)
+    - `Bicubic` (phase-correct crop-aware 9-tap bilinear Catmull-Rom spline, B=0, C=0.5)
+    - `Lanczos` (windowed sinc interpolation)
     - `AMD FidelityFX Super Resolution (FSR 1.0)` (EASU + RCAS passes)
-    - `Anime4K 3D` & `Anime4K 3D AA` (multi-pass compute pipeline)
-  - Features client-area crop, aspect ratio preservation, single-press reactivation, and 32-bit/64-bit cross-architecture support.
+    - `Anime4K 3D` & `Anime4K 3D AA` (official bloc97/Anime4K MIT compute pipeline + 9-tap Catmull-Rom final resize)
+  - Features client-area crop, aspect ratio preservation, multi-monitor virtual screen mouse wheel mapping, single-press reactivation, and 32-bit/64-bit cross-architecture support.
 - **Taskbar Per-App Volume**:
   - Hover cursor over any application icon on the Windows 11 / 10 taskbar:
     - **Mouse Wheel**: Adjust app volume by ±5%.
@@ -100,32 +101,13 @@ MenuToolsScaler.exe (Isolated Process)
 
 Проект собирается с помощью `llvm-mingw` (`clang++`) со статической линковкой (`-static`), не требуя внешних рантайм-библиотек (`libc++.dll` / `libunwind.dll`).
 
-### Команды компиляции:
+Для полной автоматизированной сборки всех 5 бинарных файлов (с кодогенерацией Anime4K, компиляцией HLSL, ресурсов и контролем размера):
 
-```powershell
-$binDir = "C:\path\to\llvm-mingw\bin"
-$clang64 = "$binDir\x86_64-w64-mingw32-clang++.exe"
-$clang32 = "$binDir\i686-w64-mingw32-clang++.exe"
-$windres64 = "$binDir\x86_64-w64-mingw32-windres.exe"
-$windres32 = "$binDir\i686-w64-mingw32-windres.exe"
-
-# 1. MenuToolsScaler.exe
-& $clang64 -std=c++17 -municode -mwindows -D_UNICODE -DUNICODE -O2 -static -I. -IScaler -IMenuCommon Scaler/ScalerMain.cpp -o MenuToolsScaler.exe -ld3d11 -ldxgi -lruntimeobject -lole32 -loleaut32 -luser32 -lgdi32 -ladvapi32 -lshlwapi
-
-# 2. MenuToolsHook64.dll (64-bit)
-& $clang64 -shared -std=c++17 -D_UNICODE -DUNICODE -D_WIN64 -O2 -static -I. -IMenuToolsHook -IMenuCommon MenuToolsHook/MenuToolsHook.cpp MenuToolsHook/MenuTools.cpp MenuToolsHook/stdafx.cpp MenuCommon/TrayIcon.cpp MenuToolsHook/MenuToolsHook64.def -o MenuToolsHook64.dll -lcomctl32 -lole32 -lshlwapi -ladvapi32 -luser32 -lshell32
-
-# 3. MenuToolsHook.dll (32-bit)
-& $clang32 -shared -std=c++17 -D_UNICODE -DUNICODE -D_WIN32 -O2 -static -I. -IMenuToolsHook -IMenuCommon MenuToolsHook/MenuToolsHook.cpp MenuToolsHook/MenuTools.cpp MenuToolsHook/stdafx.cpp MenuCommon/TrayIcon.cpp MenuToolsHook/MenuToolsHook.def -o MenuToolsHook.dll -lcomctl32 -lole32 -lshlwapi -ladvapi32 -luser32 -lshell32
-
-# 4. MenuTools64.exe (64-bit)
-& $windres64 -I. -IMenuTools MenuTools/MenuTools.rc -O coff -o MenuTools64.res.o
-& $clang64 -std=c++17 -municode -D_UNICODE -DUNICODE -D_WIN64 -O2 -static -I. -IMenuTools -IMenuCommon MenuTools/MenuTools.cpp MenuTools/Hooks.cpp MenuTools/Startup.cpp MenuTools/TaskbarVolume.cpp MenuCommon/TrayIcon.cpp MenuTools64.res.o -o MenuTools64.exe -mwindows -lcomctl32 -lole32 -loleaut32 -lshlwapi -ladvapi32
-
-# 5. MenuTools.exe (32-bit)
-& $windres32 -I. -IMenuTools MenuTools/MenuTools.rc -O coff -o MenuTools32.res.o
-& $clang32 -std=c++17 -municode -D_UNICODE -DUNICODE -D_WIN32 -O2 -static -I. -IMenuTools -IMenuCommon MenuTools/MenuTools.cpp MenuTools/Hooks.cpp MenuTools/Startup.cpp MenuTools/TaskbarVolume.cpp MenuCommon/TrayIcon.cpp MenuTools32.res.o -o MenuTools.exe -mwindows -lcomctl32 -lole32 -loleaut32 -lshlwapi -ladvapi32
+```cmd
+.\build_scaler.cmd
 ```
+
+Скрипт проверяет строгий лимит размера всех установленных бинарников ($\le 3\text{ MiB}$). Фактический суммарный размер составляет всего **~1.62 MiB** (`MenuToolsScaler.exe` — 273.5 KiB).
 
 ---
 

@@ -14,6 +14,7 @@
 #include <windows.graphics.directx.direct3d11.interop.h>
 #include <shlwapi.h>
 #include <stdio.h>
+#include <cmath>
 #include <vector>
 #include <algorithm>
 #include <atomic>
@@ -108,10 +109,18 @@ static int g_VpX = 0;
 static int g_VpY = 0;
 static int g_VpW = 0;
 static int g_VpH = 0;
-static int g_CropX = 0;
-static int g_CropY = 0;
-static int g_CropW = 0;
-static int g_CropH = 0;
+
+// WGC window texture -> target client area offset & size
+static int g_ClientCaptureX = 0;
+static int g_ClientCaptureY = 0;
+static int g_ClientW = 0;
+static int g_ClientH = 0;
+
+// Visible region inside target client area
+static int g_SourceViewX = 0;
+static int g_SourceViewY = 0;
+static int g_SourceViewW = 0;
+static int g_SourceViewH = 0;
 
 static ID3D11Device* g_pDevice = nullptr;
 static ID3D11DeviceContext* g_pContext = nullptr;
@@ -173,6 +182,12 @@ static ABI::Windows::Graphics::Capture::IGraphicsCaptureSession* g_pSession = nu
 void ShutdownScaler();
 void RenderFrame();
 void UpdateGeometry(int screenW, int screenH);
+void UpdateScalerCB(
+    float sourceW, float sourceH,
+    float sourceOffsetX, float sourceOffsetY,
+    float sourceTexW, float sourceTexH,
+    float targetW, float targetH,
+    float targetX, float targetY);
 
 // Check integrity level: medium cannot interact with high IL
 bool CheckIntegrityLevel(DWORD targetPid)
@@ -381,12 +396,85 @@ public:
     }
 };
 
-// Forward mouse messages to target window
+// Note on Input Routing Architecture:
+// Magpie virtualizes cursor position and allows native input routing through a
+// mouse-transparent scaling window; MenuTools intentionally uses a smaller
+// direct-forwarding implementation with endpoint-accurate coordinate mapping and
+// GUI focus/child window resolution.
+
+// Forward mouse wheel messages to target window with multi-monitor coordinate translation
+void ForwardWheelEvent(UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    if (!IsWindow(g_TargetHWnd)) return;
+
+    // 1. Virtual screen coordinates -> scaler overlay client coordinates
+    // Crucial for multi-monitor setups with non-zero or negative origins (e.g. secondary monitor at (-1920, 0)).
+    POINT ptOverlay = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+    ScreenToClient(g_ScalerHWnd, &ptOverlay);
+
+    // 2. Check if cursor is within active viewport
+    if (ptOverlay.x < g_VpX || ptOverlay.x >= g_VpX + g_VpW ||
+        ptOverlay.y < g_VpY || ptOverlay.y >= g_VpY + g_VpH)
+    {
+        return;
+    }
+
+    int destX = ptOverlay.x - g_VpX;
+    int destY = ptOverlay.y - g_VpY;
+
+    // 3. Endpoint-preserving mapping to source view dimensions
+    float mappedX = (g_VpW > 1) ? (float)round((double)destX * (g_SourceViewW - 1) / (g_VpW - 1)) : 0.0f;
+    float mappedY = (g_VpH > 1) ? (float)round((double)destY * (g_SourceViewH - 1) / (g_VpH - 1)) : 0.0f;
+    mappedX = (std::max)(0.0f, (std::min)(mappedX, (float)(g_SourceViewW - 1)));
+    mappedY = (std::max)(0.0f, (std::min)(mappedY, (float)(g_SourceViewH - 1)));
+
+    // 4. Target client coordinates (SourceView offset only; NEVER add g_ClientCaptureX/Y!)
+    int targetClientX = g_SourceViewX + (int)mappedX;
+    int targetClientY = g_SourceViewY + (int)mappedY;
+
+    // 5. Convert target client point to target screen coordinates (WM_MOUSEWHEEL expects screen coords)
+    POINT ptTargetScreen = { targetClientX, targetClientY };
+    ClientToScreen(g_TargetHWnd, &ptTargetScreen);
+    LPARAM targetLParam = MAKELPARAM((SHORT)ptTargetScreen.x, (SHORT)ptTargetScreen.y);
+
+    // 6. Recipient resolution
+    DWORD dwTargetThread = GetWindowThreadProcessId(g_TargetHWnd, NULL);
+    GUITHREADINFO gti = { sizeof(gti) };
+    HWND hRecipient = NULL;
+    if (dwTargetThread && GetGUIThreadInfo(dwTargetThread, &gti) && gti.hwndFocus)
+    {
+        if (gti.hwndFocus == g_TargetHWnd || IsChild(g_TargetHWnd, gti.hwndFocus))
+        {
+            hRecipient = gti.hwndFocus;
+        }
+    }
+    if (!hRecipient)
+    {
+        POINT ptClient = { targetClientX, targetClientY };
+        HWND hCur = g_TargetHWnd;
+        while (true)
+        {
+            POINT ptInCur = ptClient;
+            MapWindowPoints(g_TargetHWnd, hCur, &ptInCur, 1);
+            HWND hChild = RealChildWindowFromPoint(hCur, ptInCur);
+            if (!hChild || hChild == hCur) break;
+            if (!(GetWindowLongPtrW(hChild, GWL_STYLE) & WS_VISIBLE)) break;
+            hCur = hChild;
+        }
+        hRecipient = hCur;
+    }
+    if (!hRecipient) hRecipient = g_TargetHWnd;
+
+    // 7. Post exact unquantized wParam with translated screen coordinates
+    PostMessageW(hRecipient, msg, wParam, targetLParam);
+}
+
+// Forward mouse clicks, movements, double clicks, and extra buttons to target window
 void ForwardMouseEvent(UINT msg, WPARAM wParam, LPARAM lParam)
 {
     if (!IsWindow(g_TargetHWnd)) return;
 
-    if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN)
+    if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN || msg == WM_XBUTTONDOWN)
     {
         if (GetForegroundWindow() != g_TargetHWnd)
         {
@@ -399,21 +487,53 @@ void ForwardMouseEvent(UINT msg, WPARAM wParam, LPARAM lParam)
 
     if (x >= g_VpX && x < g_VpX + g_VpW && y >= g_VpY && y < g_VpY + g_VpH)
     {
-        float u = (float)(x - g_VpX) / (float)g_VpW;
-        float v = (float)(y - g_VpY) / (float)g_VpH;
+        int destX = x - g_VpX;
+        int destY = y - g_VpY;
 
-        int targetX = (int)(u * g_CropW);
-        int targetY = (int)(v * g_CropH);
+        float mappedX = (g_VpW > 1) ? (float)round((double)destX * (g_SourceViewW - 1) / (g_VpW - 1)) : 0.0f;
+        float mappedY = (g_VpH > 1) ? (float)round((double)destY * (g_SourceViewH - 1) / (g_VpH - 1)) : 0.0f;
+        mappedX = (std::max)(0.0f, (std::min)(mappedX, (float)(g_SourceViewW - 1)));
+        mappedY = (std::max)(0.0f, (std::min)(mappedY, (float)(g_SourceViewH - 1)));
 
-        POINT ptTarget = { targetX, targetY };
-        HWND hChild = ChildWindowFromPointEx(g_TargetHWnd, ptTarget, CWP_SKIPINVISIBLE);
-        if (!hChild) hChild = g_TargetHWnd;
-        if (hChild != g_TargetHWnd)
+        int targetClientX = g_SourceViewX + (int)mappedX;
+        int targetClientY = g_SourceViewY + (int)mappedY;
+
+        POINT ptClient = { targetClientX, targetClientY };
+        HWND hCur = g_TargetHWnd;
+        while (true)
         {
-            MapWindowPoints(g_TargetHWnd, hChild, &ptTarget, 1);
+            POINT ptInCur = ptClient;
+            MapWindowPoints(g_TargetHWnd, hCur, &ptInCur, 1);
+            HWND hChild = RealChildWindowFromPoint(hCur, ptInCur);
+            if (!hChild || hChild == hCur) break;
+            if (!(GetWindowLongPtrW(hChild, GWL_STYLE) & WS_VISIBLE)) break;
+            hCur = hChild;
+        }
+        HWND hRecipient = hCur ? hCur : g_TargetHWnd;
+
+        POINT ptInRecipient = ptClient;
+        if (hRecipient != g_TargetHWnd)
+        {
+            MapWindowPoints(g_TargetHWnd, hRecipient, &ptInRecipient, 1);
         }
 
-        PostMessageW(hChild, msg, wParam, MAKELPARAM(ptTarget.x, ptTarget.y));
+        bool isDblClk = (msg == WM_LBUTTONDBLCLK || msg == WM_RBUTTONDBLCLK ||
+                         msg == WM_MBUTTONDBLCLK || msg == WM_XBUTTONDBLCLK);
+        if (isDblClk)
+        {
+            ULONG_PTR classStyle = GetClassLongPtrW(hRecipient, GCL_STYLE);
+            if (!(classStyle & CS_DBLCLKS))
+            {
+                // Emulate as button down if recipient window class lacks CS_DBLCLKS
+                UINT downMsg = (msg == WM_LBUTTONDBLCLK) ? WM_LBUTTONDOWN :
+                               (msg == WM_RBUTTONDBLCLK) ? WM_RBUTTONDOWN :
+                               (msg == WM_MBUTTONDBLCLK) ? WM_MBUTTONDOWN : WM_XBUTTONDOWN;
+                PostMessageW(hRecipient, downMsg, wParam, MAKELPARAM(ptInRecipient.x, ptInRecipient.y));
+                return;
+            }
+        }
+
+        PostMessageW(hRecipient, msg, wParam, MAKELPARAM(ptInRecipient.x, ptInRecipient.y));
     }
 }
 
@@ -437,15 +557,21 @@ LRESULT CALLBACK ScalerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
     case WM_RBUTTONUP:
     case WM_MBUTTONDOWN:
     case WM_MBUTTONUP:
+    case WM_LBUTTONDBLCLK:
+    case WM_RBUTTONDBLCLK:
+    case WM_MBUTTONDBLCLK:
         ForwardMouseEvent(msg, wParam, lParam);
         return 0;
 
+    case WM_XBUTTONDOWN:
+    case WM_XBUTTONUP:
+    case WM_XBUTTONDBLCLK:
+        ForwardMouseEvent(msg, wParam, lParam);
+        return TRUE;
+
     case WM_MOUSEWHEEL:
     case WM_MOUSEHWHEEL:
-        if (IsWindow(g_TargetHWnd))
-        {
-            PostMessageW(g_TargetHWnd, msg, wParam, lParam);
-        }
+        ForwardWheelEvent(msg, wParam, lParam);
         return 0;
 
     case WM_APP_SCALER_FOCUS_LOST:
@@ -478,6 +604,37 @@ LRESULT CALLBACK ScalerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
+// Update Constant Buffer helper for pipeline transitions
+void UpdateScalerCB(
+    float sourceW, float sourceH,
+    float sourceOffsetX, float sourceOffsetY,
+    float sourceTexW, float sourceTexH,
+    float targetW, float targetH,
+    float targetX, float targetY)
+{
+    if (!g_pContext || !g_pConstantBuffer) return;
+
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    HRESULT hr = g_pContext->Map(g_pConstantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (SUCCEEDED(hr))
+    {
+        ScalerCBData* cb = (ScalerCBData*)mapped.pData;
+        cb->SourceSize[0] = sourceW;
+        cb->SourceSize[1] = sourceH;
+        cb->SourceOffset[0] = sourceOffsetX;
+        cb->SourceOffset[1] = sourceOffsetY;
+        cb->TargetSize[0] = targetW;
+        cb->TargetSize[1] = targetH;
+        cb->TargetOffset[0] = targetX;
+        cb->TargetOffset[1] = targetY;
+        cb->FullTargetSize[0] = (float)g_VpW;
+        cb->FullTargetSize[1] = (float)g_VpH;
+        cb->SourceTexSize[0] = sourceTexW;
+        cb->SourceTexSize[1] = sourceTexH;
+        g_pContext->Unmap(g_pConstantBuffer, 0);
+    }
+}
+
 // Geometry & Crop calculations
 void UpdateGeometry(int screenW, int screenH)
 {
@@ -490,22 +647,57 @@ void UpdateGeometry(int screenW, int screenH)
     RECT rcWindow = { 0 };
     GetWindowRect(g_TargetHWnd, &rcWindow);
 
-    g_CropX = (ptClient.x > rcWindow.left) ? (ptClient.x - rcWindow.left) : 0;
-    g_CropY = (ptClient.y > rcWindow.top) ? (ptClient.y - rcWindow.top) : 0;
-    g_CropW = rcClient.right - rcClient.left;
-    g_CropH = rcClient.bottom - rcClient.top;
+    g_ClientCaptureX = (ptClient.x > rcWindow.left) ? (ptClient.x - rcWindow.left) : 0;
+    g_ClientCaptureY = (ptClient.y > rcWindow.top) ? (ptClient.y - rcWindow.top) : 0;
+    g_ClientW = rcClient.right - rcClient.left;
+    g_ClientH = rcClient.bottom - rcClient.top;
 
-    if (g_CropW <= 0 || g_CropH <= 0)
+    if (g_ClientW <= 0 || g_ClientH <= 0)
     {
-        g_CropX = 0;
-        g_CropY = 0;
-        g_CropW = (std::max)(1, (int)(rcWindow.right - rcWindow.left));
-        g_CropH = (std::max)(1, (int)(rcWindow.bottom - rcWindow.top));
+        g_ClientCaptureX = 0;
+        g_ClientCaptureY = 0;
+        g_ClientW = (std::max)(1, (int)(rcWindow.right - rcWindow.left));
+        g_ClientH = (std::max)(1, (int)(rcWindow.bottom - rcWindow.top));
     }
 
-    if (g_PreserveAspect && g_CropW > 0 && g_CropH > 0)
+    if (g_FilterId == MT_SCALER_FILTER_PIXEL_PERFECT)
     {
-        float targetAR = (float)g_CropW / (float)g_CropH;
+        if (g_ClientW > screenW || g_ClientH > screenH)
+        {
+            // Oversized source: Pure 1:1 scale with center crop
+            g_VpW = (std::min)(g_ClientW, screenW);
+            g_VpH = (std::min)(g_ClientH, screenH);
+            g_VpX = (screenW - g_VpW) / 2;
+            g_VpY = (screenH - g_VpH) / 2;
+
+            // Center crop within client area
+            g_SourceViewW = g_VpW;
+            g_SourceViewH = g_VpH;
+            g_SourceViewX = (g_ClientW - g_SourceViewW) / 2;
+            g_SourceViewY = (g_ClientH - g_SourceViewH) / 2;
+        }
+        else
+        {
+            // Normal integer scale >= 1
+            int scaleX = screenW / g_ClientW;
+            int scaleY = screenH / g_ClientH;
+            int scale = (std::min)(scaleX, scaleY);
+            if (scale < 1) scale = 1;
+
+            g_VpW = g_ClientW * scale;
+            g_VpH = g_ClientH * scale;
+            g_VpX = (screenW - g_VpW) / 2;
+            g_VpY = (screenH - g_VpH) / 2;
+
+            g_SourceViewX = 0;
+            g_SourceViewY = 0;
+            g_SourceViewW = g_ClientW;
+            g_SourceViewH = g_ClientH;
+        }
+    }
+    else if (g_PreserveAspect && g_ClientW > 0 && g_ClientH > 0)
+    {
+        float targetAR = (float)g_ClientW / (float)g_ClientH;
         float screenAR = (float)screenW / (float)screenH;
 
         if (targetAR < screenAR)
@@ -524,13 +716,24 @@ void UpdateGeometry(int screenW, int screenH)
             g_VpX = 0;
             g_VpY = (screenH - g_VpH) / 2;
         }
+
+        g_SourceViewX = 0;
+        g_SourceViewY = 0;
+        g_SourceViewW = g_ClientW;
+        g_SourceViewH = g_ClientH;
     }
     else
     {
+        // Stretch to fill fullscreen
         g_VpX = 0;
         g_VpY = 0;
         g_VpW = screenW;
         g_VpH = screenH;
+
+        g_SourceViewX = 0;
+        g_SourceViewY = 0;
+        g_SourceViewW = g_ClientW;
+        g_SourceViewH = g_ClientH;
     }
 }
 
@@ -738,27 +941,16 @@ void RenderFrame()
     if (SUCCEEDED(hr) && pCapturedSRV)
     {
         // Update Constant Buffer
-        D3D11_MAPPED_SUBRESOURCE mapped;
-        if (SUCCEEDED(g_pContext->Map(g_pConstantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
-        {
-            ScalerCBData* cb = (ScalerCBData*)mapped.pData;
-            cb->SourceSize[0] = (float)g_CropW;
-            cb->SourceSize[1] = (float)g_CropH;
-            cb->SourceOffset[0] = (float)g_CropX;
-            cb->SourceOffset[1] = (float)g_CropY;
-            cb->TargetSize[0] = (float)g_VpW;
-            cb->TargetSize[1] = (float)g_VpH;
-            cb->TargetOffset[0] = (float)g_VpX;
-            cb->TargetOffset[1] = (float)g_VpY;
-            cb->FullTargetSize[0] = (float)screenW;
-            cb->FullTargetSize[1] = (float)screenH;
-            cb->SourceTexSize[0] = (float)texDesc.Width;
-            cb->SourceTexSize[1] = (float)texDesc.Height;
-            g_pContext->Unmap(g_pConstantBuffer, 0);
-        }
+        UpdateScalerCB(
+            (float)g_SourceViewW, (float)g_SourceViewH,
+            (float)(g_ClientCaptureX + g_SourceViewX), (float)(g_ClientCaptureY + g_SourceViewY),
+            (float)texDesc.Width, (float)texDesc.Height,
+            (float)g_VpW, (float)g_VpH,
+            (float)g_VpX, (float)g_VpY);
 
         // Clear backbuffer UAV to black if letterbox or pillarbox is active
-        if (g_PreserveAspect && (g_VpX > 0 || g_VpY > 0 || g_VpW < screenW || g_VpH < screenH))
+        const bool hasBars = (g_VpX != 0 || g_VpY != 0 || g_VpW != screenW || g_VpH != screenH);
+        if (hasBars)
         {
             float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
             g_pContext->ClearUnorderedAccessViewFloat(g_pBackBufferUAV, black);
@@ -776,6 +968,7 @@ void RenderFrame()
         switch (g_FilterId)
         {
         case MT_SCALER_FILTER_NEAREST:
+        case MT_SCALER_FILTER_PIXEL_PERFECT:
         {
             if (g_pNearestCS)
             {
@@ -819,6 +1012,13 @@ void RenderFrame()
             if (EnsureFSRIntermediate((UINT)g_VpW, (UINT)g_VpH) && g_pFsrEasuCS && g_pFsrRcasCS)
             {
                 // Pass 1: EASU
+                UpdateScalerCB(
+                    (float)g_SourceViewW, (float)g_SourceViewH,
+                    (float)(g_ClientCaptureX + g_SourceViewX), (float)(g_ClientCaptureY + g_SourceViewY),
+                    (float)texDesc.Width, (float)texDesc.Height,
+                    (float)g_VpW, (float)g_VpH,
+                    0.0f, 0.0f);
+
                 g_pContext->CSSetShader(g_pFsrEasuCS, nullptr, 0);
                 g_pContext->CSSetShaderResources(0, 1, &pCapturedSRV);
                 g_pContext->CSSetUnorderedAccessViews(0, 1, &g_pFsrIntermediateUAV, nullptr);
@@ -827,6 +1027,13 @@ void RenderFrame()
                 g_pContext->CSSetUnorderedAccessViews(0, 1, nullUAV, nullptr);
 
                 // Pass 2: RCAS
+                UpdateScalerCB(
+                    (float)g_VpW, (float)g_VpH,
+                    0.0f, 0.0f,
+                    (float)g_VpW, (float)g_VpH,
+                    (float)g_VpW, (float)g_VpH,
+                    (float)g_VpX, (float)g_VpY);
+
                 g_pContext->CSSetShader(g_pFsrRcasCS, nullptr, 0);
                 g_pContext->CSSetShaderResources(0, 1, &g_pFsrIntermediateSRV);
                 g_pContext->CSSetUnorderedAccessViews(0, 1, &g_pBackBufferUAV, nullptr);
@@ -839,7 +1046,7 @@ void RenderFrame()
         case MT_SCALER_FILTER_ANIME4K_3D:
         case MT_SCALER_FILTER_ANIME4K_3D_AA:
         {
-            if (EnsureAnime4KIntermediates((UINT)g_CropW, (UINT)g_CropH))
+            if (EnsureAnime4KIntermediates((UINT)g_SourceViewW, (UINT)g_SourceViewH))
             {
                 ID3D11ComputeShader* p1 = (g_FilterId == MT_SCALER_FILTER_ANIME4K_3D) ? g_pAnime4K_3D_P1 : g_pAnime4K_3D_AA_P1;
                 ID3D11ComputeShader* p2 = (g_FilterId == MT_SCALER_FILTER_ANIME4K_3D) ? g_pAnime4K_3D_P2 : g_pAnime4K_3D_AA_P2;
@@ -847,6 +1054,13 @@ void RenderFrame()
 
                 if (g_A4KPassMode == 1) // Diagnostic Pass Isolation: Capture -> Final (Bypass)
                 {
+                    UpdateScalerCB(
+                        (float)g_SourceViewW, (float)g_SourceViewH,
+                        (float)(g_ClientCaptureX + g_SourceViewX), (float)(g_ClientCaptureY + g_SourceViewY),
+                        (float)texDesc.Width, (float)texDesc.Height,
+                        (float)g_VpW, (float)g_VpH,
+                        (float)g_VpX, (float)g_VpY);
+
                     g_pContext->CSSetShader(g_pAnime4K_Final, nullptr, 0);
                     g_pContext->CSSetShaderResources(0, 1, &pCapturedSRV);
                     g_pContext->CSSetUnorderedAccessViews(0, 1, &g_pBackBufferUAV, nullptr);
@@ -856,12 +1070,26 @@ void RenderFrame()
                 }
                 else if (g_A4KPassMode == 2) // Diagnostic Pass Isolation: Pass 1 -> Final
                 {
+                    UpdateScalerCB(
+                        (float)g_SourceViewW, (float)g_SourceViewH,
+                        (float)(g_ClientCaptureX + g_SourceViewX), (float)(g_ClientCaptureY + g_SourceViewY),
+                        (float)texDesc.Width, (float)texDesc.Height,
+                        (float)g_SourceViewW, (float)g_SourceViewH,
+                        0.0f, 0.0f);
+
                     g_pContext->CSSetShader(p1, nullptr, 0);
                     g_pContext->CSSetShaderResources(0, 1, &pCapturedSRV);
                     g_pContext->CSSetUnorderedAccessViews(0, 1, &g_pA4KUAV1, nullptr);
-                    g_pContext->Dispatch((g_CropW + 15) / 16, (g_CropH + 15) / 16, 1);
+                    g_pContext->Dispatch((g_SourceViewW + 15) / 16, (g_SourceViewH + 15) / 16, 1);
                     g_pContext->CSSetShaderResources(0, 1, nullSRV);
                     g_pContext->CSSetUnorderedAccessViews(0, 1, nullUAV, nullptr);
+
+                    UpdateScalerCB(
+                        (float)g_SourceViewW, (float)g_SourceViewH,
+                        0.0f, 0.0f,
+                        (float)g_A4KAllocW, (float)g_A4KAllocH,
+                        (float)g_VpW, (float)g_VpH,
+                        (float)g_VpX, (float)g_VpY);
 
                     g_pContext->CSSetShader(g_pAnime4K_Final, nullptr, 0);
                     g_pContext->CSSetShaderResources(0, 1, &g_pA4KSRV1);
@@ -872,19 +1100,40 @@ void RenderFrame()
                 }
                 else if (g_A4KPassMode == 3) // Diagnostic Pass Isolation: Pass 1 -> Pass 2 -> Final
                 {
+                    UpdateScalerCB(
+                        (float)g_SourceViewW, (float)g_SourceViewH,
+                        (float)(g_ClientCaptureX + g_SourceViewX), (float)(g_ClientCaptureY + g_SourceViewY),
+                        (float)texDesc.Width, (float)texDesc.Height,
+                        (float)g_SourceViewW, (float)g_SourceViewH,
+                        0.0f, 0.0f);
+
                     g_pContext->CSSetShader(p1, nullptr, 0);
                     g_pContext->CSSetShaderResources(0, 1, &pCapturedSRV);
                     g_pContext->CSSetUnorderedAccessViews(0, 1, &g_pA4KUAV1, nullptr);
-                    g_pContext->Dispatch((g_CropW + 15) / 16, (g_CropH + 15) / 16, 1);
+                    g_pContext->Dispatch((g_SourceViewW + 15) / 16, (g_SourceViewH + 15) / 16, 1);
                     g_pContext->CSSetShaderResources(0, 1, nullSRV);
                     g_pContext->CSSetUnorderedAccessViews(0, 1, nullUAV, nullptr);
+
+                    UpdateScalerCB(
+                        (float)g_SourceViewW, (float)g_SourceViewH,
+                        0.0f, 0.0f,
+                        (float)g_A4KAllocW, (float)g_A4KAllocH,
+                        (float)g_SourceViewW, (float)g_SourceViewH,
+                        0.0f, 0.0f);
 
                     g_pContext->CSSetShader(p2, nullptr, 0);
                     g_pContext->CSSetShaderResources(0, 1, &g_pA4KSRV1);
                     g_pContext->CSSetUnorderedAccessViews(0, 1, &g_pA4KUAV2, nullptr);
-                    g_pContext->Dispatch((g_CropW + 15) / 16, (g_CropH + 15) / 16, 1);
+                    g_pContext->Dispatch((g_SourceViewW + 15) / 16, (g_SourceViewH + 15) / 16, 1);
                     g_pContext->CSSetShaderResources(0, 1, nullSRV);
                     g_pContext->CSSetUnorderedAccessViews(0, 1, nullUAV, nullptr);
+
+                    UpdateScalerCB(
+                        (float)g_SourceViewW, (float)g_SourceViewH,
+                        0.0f, 0.0f,
+                        (float)g_A4KAllocW, (float)g_A4KAllocH,
+                        (float)g_VpW, (float)g_VpH,
+                        (float)g_VpX, (float)g_VpY);
 
                     g_pContext->CSSetShader(g_pAnime4K_Final, nullptr, 0);
                     g_pContext->CSSetShaderResources(0, 1, &g_pA4KSRV2);
@@ -896,48 +1145,58 @@ void RenderFrame()
                 else // Standard mode 0: Full Pass 1 -> Pass 2 -> Pass 3 (2x) -> Final (Catmull-Rom to Viewport)
                 {
                     // Pass 1
+                    UpdateScalerCB(
+                        (float)g_SourceViewW, (float)g_SourceViewH,
+                        (float)(g_ClientCaptureX + g_SourceViewX), (float)(g_ClientCaptureY + g_SourceViewY),
+                        (float)texDesc.Width, (float)texDesc.Height,
+                        (float)g_SourceViewW, (float)g_SourceViewH,
+                        0.0f, 0.0f);
+
                     g_pContext->CSSetShader(p1, nullptr, 0);
                     g_pContext->CSSetShaderResources(0, 1, &pCapturedSRV);
                     g_pContext->CSSetUnorderedAccessViews(0, 1, &g_pA4KUAV1, nullptr);
-                    g_pContext->Dispatch((g_CropW + 15) / 16, (g_CropH + 15) / 16, 1);
+                    g_pContext->Dispatch((g_SourceViewW + 15) / 16, (g_SourceViewH + 15) / 16, 1);
                     g_pContext->CSSetShaderResources(0, 1, nullSRV);
                     g_pContext->CSSetUnorderedAccessViews(0, 1, nullUAV, nullptr);
 
                     // Pass 2
+                    UpdateScalerCB(
+                        (float)g_SourceViewW, (float)g_SourceViewH,
+                        0.0f, 0.0f,
+                        (float)g_A4KAllocW, (float)g_A4KAllocH,
+                        (float)g_SourceViewW, (float)g_SourceViewH,
+                        0.0f, 0.0f);
+
                     g_pContext->CSSetShader(p2, nullptr, 0);
                     g_pContext->CSSetShaderResources(0, 1, &g_pA4KSRV1);
                     g_pContext->CSSetUnorderedAccessViews(0, 1, &g_pA4KUAV2, nullptr);
-                    g_pContext->Dispatch((g_CropW + 15) / 16, (g_CropH + 15) / 16, 1);
+                    g_pContext->Dispatch((g_SourceViewW + 15) / 16, (g_SourceViewH + 15) / 16, 1);
                     g_pContext->CSSetShaderResources(0, 1, nullSRV);
                     g_pContext->CSSetUnorderedAccessViews(0, 1, nullUAV, nullptr);
 
                     // Pass 3 (2x Output)
+                    UpdateScalerCB(
+                        (float)g_SourceViewW, (float)g_SourceViewH,
+                        (float)(g_ClientCaptureX + g_SourceViewX), (float)(g_ClientCaptureY + g_SourceViewY),
+                        (float)texDesc.Width, (float)texDesc.Height,
+                        (float)(g_SourceViewW * 2), (float)(g_SourceViewH * 2),
+                        0.0f, 0.0f);
+
                     ID3D11ShaderResourceView* p3SRVs[] = { pCapturedSRV, g_pA4KSRV2 };
                     g_pContext->CSSetShader(p3, nullptr, 0);
                     g_pContext->CSSetShaderResources(0, 2, p3SRVs);
                     g_pContext->CSSetUnorderedAccessViews(0, 1, &g_pA4KUAV2x, nullptr);
-                    g_pContext->Dispatch((g_CropW + 15) / 16, (g_CropH + 15) / 16, 1);
+                    g_pContext->Dispatch((g_SourceViewW + 15) / 16, (g_SourceViewH + 15) / 16, 1);
                     g_pContext->CSSetShaderResources(0, 2, nullSRV);
                     g_pContext->CSSetUnorderedAccessViews(0, 1, nullUAV, nullptr);
 
                     // Pass 4: Final Catmull-Rom Resize to Viewport
-                    if (SUCCEEDED(g_pContext->Map(g_pConstantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
-                    {
-                        ScalerCBData* cb = (ScalerCBData*)mapped.pData;
-                        cb->SourceSize[0] = (float)(g_CropW * 2);
-                        cb->SourceSize[1] = (float)(g_CropH * 2);
-                        cb->SourceOffset[0] = 0.0f;
-                        cb->SourceOffset[1] = 0.0f;
-                        cb->TargetSize[0] = (float)g_VpW;
-                        cb->TargetSize[1] = (float)g_VpH;
-                        cb->TargetOffset[0] = (float)g_VpX;
-                        cb->TargetOffset[1] = (float)g_VpY;
-                        cb->FullTargetSize[0] = (float)screenW;
-                        cb->FullTargetSize[1] = (float)screenH;
-                        cb->SourceTexSize[0] = (float)(g_CropW * 2);
-                        cb->SourceTexSize[1] = (float)(g_CropH * 2);
-                        g_pContext->Unmap(g_pConstantBuffer, 0);
-                    }
+                    UpdateScalerCB(
+                        (float)(g_SourceViewW * 2), (float)(g_SourceViewH * 2),
+                        0.0f, 0.0f,
+                        (float)(g_A4KAllocW * 2), (float)(g_A4KAllocH * 2),
+                        (float)g_VpW, (float)g_VpH,
+                        (float)g_VpX, (float)g_VpY);
 
                     g_pContext->CSSetShader(g_pAnime4K_Final, nullptr, 0);
                     g_pContext->CSSetShaderResources(0, 1, &g_pA4KSRV2x);
@@ -1123,6 +1382,16 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     UNREFERENCED_PARAMETER(hPrevInstance);
     UNREFERENCED_PARAMETER(nCmdShow);
 
+    // Enable Per-Monitor V2 DPI awareness if supported
+    typedef BOOL (WINAPI *pfn_SetProcessDpiAwarenessContext)(HANDLE);
+    auto pfnSetDpiAwareness = (pfn_SetProcessDpiAwarenessContext)GetProcAddress(
+        GetModuleHandleW(L"user32.dll"), "SetProcessDpiAwarenessContext");
+    if (pfnSetDpiAwareness)
+    {
+        // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ((HANDLE)-4)
+        pfnSetDpiAwareness((HANDLE)-4);
+    }
+
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(lpCmdLine, &argc);
     if (!argv || argc < 4)
@@ -1215,6 +1484,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
 
     // Register Scaler Window Class
     WNDCLASSEXW wc = { sizeof(wc) };
+    wc.style = CS_DBLCLKS;
     wc.lpfnWndProc = ScalerWndProc;
     wc.hInstance = hInstance;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
@@ -1348,8 +1618,8 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     g_pDevice->CreateComputeShader(g_Nearest_CS, g_Nearest_CS_size, nullptr, &g_pNearestCS);
     g_pDevice->CreateComputeShader(g_Bicubic_CS, g_Bicubic_CS_size, nullptr, &g_pBicubicCS);
     g_pDevice->CreateComputeShader(g_Lanczos_CS, g_Lanczos_CS_size, nullptr, &g_pLanczosCS);
-    g_pDevice->CreateComputeShader(g_FSR_EASU_CS, g_FSR_EASU_CS_size, nullptr, &g_pFsrEasuCS);
-    g_pDevice->CreateComputeShader(g_FSR_RCAS_CS, g_FSR_RCAS_CS_size, nullptr, &g_pFsrRcasCS);
+    g_pDevice->CreateComputeShader(g_FsrEasu_CS, g_FsrEasu_CS_size, nullptr, &g_pFsrEasuCS);
+    g_pDevice->CreateComputeShader(g_FsrRcas_CS, g_FsrRcas_CS_size, nullptr, &g_pFsrRcasCS);
     g_pDevice->CreateComputeShader(g_Anime4K_3D_Pass1_CS, g_Anime4K_3D_Pass1_CS_size, nullptr, &g_pAnime4K_3D_P1);
     g_pDevice->CreateComputeShader(g_Anime4K_3D_Pass2_CS, g_Anime4K_3D_Pass2_CS_size, nullptr, &g_pAnime4K_3D_P2);
     g_pDevice->CreateComputeShader(g_Anime4K_3D_Pass3_CS, g_Anime4K_3D_Pass3_CS_size, nullptr, &g_pAnime4K_3D_P3);
@@ -1363,6 +1633,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     switch (g_FilterId)
     {
     case MT_SCALER_FILTER_NEAREST:
+    case MT_SCALER_FILTER_PIXEL_PERFECT:
         shadersValid = (g_pNearestCS != nullptr);
         break;
     case MT_SCALER_FILTER_BICUBIC:
@@ -1405,7 +1676,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmd
     }
     else if (g_FilterId == MT_SCALER_FILTER_ANIME4K_3D || g_FilterId == MT_SCALER_FILTER_ANIME4K_3D_AA)
     {
-        if (!EnsureAnime4KIntermediates((UINT)g_CropW, (UINT)g_CropH))
+        if (!EnsureAnime4KIntermediates((UINT)g_SourceViewW, (UINT)g_SourceViewH))
         {
             ScalerLog("Preallocation of Anime4K intermediate textures failed!\n");
             dxgiDevice->Release();
