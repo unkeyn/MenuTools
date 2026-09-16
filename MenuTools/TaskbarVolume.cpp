@@ -157,6 +157,9 @@ namespace
 	{
 		switch (uMsg)
 		{
+		case WM_MOUSEACTIVATE:
+			return MA_NOACTIVATE;
+
 		case WM_PAINT:
 		{
 			PAINTSTRUCT ps;
@@ -229,8 +232,10 @@ namespace
 			y = buttonRect.bottom + 6;
 		}
 
+		// Explicitly raise OSD above Windows taskbar thumbnail preview on every show/refresh
 		SetWindowPos(g_hOsdWnd, HWND_TOPMOST, x, y, osdWidth, osdHeight, SWP_NOACTIVATE | SWP_SHOWWINDOW);
 		InvalidateRect(g_hOsdWnd, NULL, TRUE);
+		UpdateWindow(g_hOsdWnd);
 
 		// Reset hide timer to 800 ms
 		SetTimer(g_hOsdWnd, TIMER_OSD_HIDE, 800, NULL);
