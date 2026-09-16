@@ -2,6 +2,9 @@
 #include "Startup.h"
 
 #include <ShellAPI.h>
+#include <shlwapi.h>
+
+#pragma comment(lib, "shlwapi.lib")
 
 Startup::Startup()
 {
@@ -52,6 +55,7 @@ BOOL Startup::CreateJob()
 	{
 		return FALSE;
 	}
+	DWORD dwErr = GetLastError();
 
 #ifdef _WIN64
 #if !MT_DEBUG_ONLY_X64
@@ -71,7 +75,7 @@ BOOL Startup::CreateJob()
 #endif
 
 	// If the job already exists
-	if (GetLastError() == ERROR_ALREADY_EXISTS)
+	if (dwErr == ERROR_ALREADY_EXISTS)
 	{
 #ifdef _WIN64
 		// Close the job handle
@@ -114,10 +118,23 @@ BOOL Startup::CreateJobChild()
 		return FALSE;
 	}
 
-	// Creates a new process is created in a suspended state
-	if (!CreateProcess(MT_EXE_NAME64, NULL, NULL, NULL, FALSE,
+	TCHAR szExeDir[MAX_PATH];
+	GetModuleFileName(NULL, szExeDir, MAX_PATH);
+	PathRemoveFileSpec(szExeDir);
+	TCHAR szExe64[MAX_PATH];
+	PathCombine(szExe64, szExeDir, MT_EXE_NAME64);
+
+	// Creates a new process in a suspended state
+	BOOL bCreated = CreateProcess(szExe64, NULL, NULL, NULL, FALSE,
 		CREATE_SUSPENDED | CREATE_BREAKAWAY_FROM_JOB,
-		NULL, NULL, &si, &pi))
+		NULL, szExeDir, &si, &pi);
+	if (!bCreated)
+	{
+		bCreated = CreateProcess(szExe64, NULL, NULL, NULL, FALSE,
+			CREATE_SUSPENDED,
+			NULL, szExeDir, &si, &pi);
+	}
+	if (!bCreated)
 	{
 		return FALSE;
 	}
@@ -125,7 +142,7 @@ BOOL Startup::CreateJobChild()
 	// Assigns a process to an existing job object
 	if (!AssignProcessToJobObject(hJob, pi.hProcess))
 	{
-		return FALSE;
+		// If assign fails because child inherited job already, continue
 	}
 
 	// Execution of the thread is resumed

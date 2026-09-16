@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdint.h>
+
 // Debug
 #define MT_DEBUG_ONLY_X86					FALSE
 #define MT_DEBUG_ONLY_X64					FALSE
@@ -26,35 +28,63 @@
 
 // Hook -> Messages
 #define MT_HOOK_MSG_QUIT					RegisterWindowMessage(_T("MenuToolsQuit"))
-#define MT_HOOK_MSG_TRAY					WM_USER + 0x210
+#define MT_HOOK_MSG_TRAY					(WM_USER + 0x210)
 
 // Menu
-#define MT_MENU_PRIORITY					WM_USER + 0x2100
-#define MT_MENU_TRANSPARENCY				WM_USER + 0x2200
-#define MT_MENU_ALWAYS_ON_TOP				WM_USER + 0x2010
-#define MT_MENU_MINIMIZE_TO_TRAY			WM_USER + 0x2020
-#define MT_MENU_SEPARATOR					WM_USER + 0x2030
+#define MT_MENU_ALWAYS_ON_TOP				(WM_USER + 0x2010)
+#define MT_MENU_HIDE_TOP					(WM_USER + 0x2040)
+#define MT_MENU_MINIMIZE_TO_TRAY			(WM_USER + 0x2020)
+#define MT_MENU_SEPARATOR					(WM_USER + 0x2030)
 
-// Menu -> Priority
-#define MT_MENU_PRIORITY_REALTIME			WM_USER + 0x2110
-#define MT_MENU_PRIORITY_HIGH				WM_USER + 0x2120
-#define MT_MENU_PRIORITY_ABOVE_NORMAL		WM_USER + 0x2130
-#define MT_MENU_PRIORITY_NORMAL				WM_USER + 0x2140
-#define MT_MENU_PRIORITY_BELOW_NORMAL		WM_USER + 0x2150
-#define MT_MENU_PRIORITY_LOW				WM_USER + 0x2160
+#define MT_MENU_FULLSCREEN					(WM_USER + 0x2050)
+#define MT_MENU_FULLSCREEN_BICUBIC			(WM_USER + 0x2051)
+#define MT_MENU_FULLSCREEN_LANCZOS			(WM_USER + 0x2052)
+#define MT_MENU_FULLSCREEN_FSR				(WM_USER + 0x2053)
+#define MT_MENU_FULLSCREEN_ANIME4K_3D		(WM_USER + 0x2054)
+#define MT_MENU_FULLSCREEN_ANIME4K_3D_AA	(WM_USER + 0x2055)
+#define MT_MENU_FULLSCREEN_ASPECT_RATIO		(WM_USER + 0x2056)
+#define MT_MENU_FULLSCREEN_EXIT				(WM_USER + 0x2057)
+#define MT_MENU_FULLSCREEN_NEAREST			(WM_USER + 0x2058)
 
-// Menu -> Transparency
-#define MT_MENU_TRANSPARENCY_0				WM_USER + 0x2210
-#define MT_MENU_TRANSPARENCY_10				WM_USER + 0x2220
-#define MT_MENU_TRANSPARENCY_20				WM_USER + 0x2230
-#define MT_MENU_TRANSPARENCY_30				WM_USER + 0x2240
-#define MT_MENU_TRANSPARENCY_40				WM_USER + 0x2250
-#define MT_MENU_TRANSPARENCY_50				WM_USER + 0x2260
-#define MT_MENU_TRANSPARENCY_60				WM_USER + 0x2270
-#define MT_MENU_TRANSPARENCY_70				WM_USER + 0x2280
-#define MT_MENU_TRANSPARENCY_80				WM_USER + 0x2290
-#define MT_MENU_TRANSPARENCY_90				WM_USER + 0x22A0
-#define MT_MENU_TRANSPARENCY_100			WM_USER + 0x22B0
+// Scaler Filter Enum & IDs
+enum ScalerFilter : uint32_t
+{
+	SCALER_FILTER_BICUBIC		= 0,
+	SCALER_FILTER_LANCZOS		= 1,
+	SCALER_FILTER_FSR			= 2,
+	SCALER_FILTER_ANIME4K_3D	= 3,
+	SCALER_FILTER_ANIME4K_3D_AA	= 4,
+	SCALER_FILTER_NEAREST		= 5
+};
+
+#define MT_SCALER_FILTER_BICUBIC			0
+#define MT_SCALER_FILTER_LANCZOS			1
+#define MT_SCALER_FILTER_FSR				2
+#define MT_SCALER_FILTER_ANIME4K_3D			3
+#define MT_SCALER_FILTER_ANIME4K_3D_AA		4
+#define MT_SCALER_FILTER_NEAREST			5
+
+// Hotkey ID
+#define MT_HOTKEY_SCALER_ID					0x5343 // "SC"
+
+// Scaler Executable
+#define MT_SCALER_EXE_NAME					_T("MenuToolsScaler.exe")
+
+// Properties
+#define MT_PROP_ORIG_STYLE					_T("MenuTools_HideTop_OrigStyle")
+#define MT_PROP_SCALED						_T("MenuTools_Scaled")
+
+// Scaler IPC Messages
+#define MT_MSG_SCALER_NAME					_T("MenuTools_Scaler_Msg")
+
+// Scaler IPC Sync Objects
+#define MT_SCALER_MUTEX_NAME				_T("Local\\MenuToolsScaler.Active")
+#define MT_SCALER_EXIT_EVENT_NAME			_T("Local\\MenuToolsScaler.Exit")
+
+// Scaler IPC commands (passed in wParam)
+#define MT_SCALER_CMD_START					1
+#define MT_SCALER_CMD_STOP					2
+#define MT_SCALER_CMD_TOGGLE_ASPECT			3
 
 // Tray
-#define MT_TRAY_MESSAGE						WM_USER + 0x200
+#define MT_TRAY_MESSAGE						(WM_USER + 0x200)

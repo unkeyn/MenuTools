@@ -30,16 +30,20 @@ LRESULT CALLBACK HookProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	case MT_HOOK_MSG_TRAY:
 	{
 		// Process tray messages
-		MenuTools::TrayProc(hWnd, wParam, lParam);
-		return TRUE;
+		if (MenuTools::TrayProc(hWnd, wParam, lParam))
+		{
+			return TRUE;
+		}
 		break;
 	}
 	case WM_COMMAND:
 	case WM_SYSCOMMAND:
 	{
 		// Process menu messages
-		MenuTools::WndProc(hWnd, wParam, lParam);
-		return TRUE;
+		if (MenuTools::WndProc(hWnd, wParam, lParam))
+		{
+			return TRUE;
+		}
 		break;
 	}
 		// Roll-up/Unroll (hard coded for now)
@@ -110,7 +114,7 @@ LRESULT CALLBACK HookProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 }
 
 // Sent messages
-LRESULT CALLBACK CallWndProc(
+extern "C" LRESULT CALLBACK CallWndProc(
 	_In_  int nCode,
 	_In_  WPARAM wParam,
 	_In_  LPARAM lParam
@@ -129,7 +133,7 @@ LRESULT CALLBACK CallWndProc(
 }
 
 // Post messages
-LRESULT CALLBACK GetMsgProc(
+extern "C" LRESULT CALLBACK GetMsgProc(
 	_In_  int code,
 	_In_  WPARAM wParam,
 	_In_  LPARAM lParam

@@ -70,5 +70,6 @@ HICON TrayIcon::GetWindowIcon(HWND hWnd)
 		return hIcon;
 	}
 
+	hIcon = LoadIcon(NULL, IDI_APPLICATION);
 	return hIcon;
 }

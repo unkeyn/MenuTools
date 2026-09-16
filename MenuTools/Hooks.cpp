@@ -1,5 +1,8 @@
 #include "stdafx.h"
 #include "Hooks.h"
+#include <shlwapi.h>
+
+#pragma comment(lib, "shlwapi.lib")
 
 Hooks::Hooks()
 {
@@ -13,8 +16,13 @@ Hooks::~Hooks()
 
 BOOL Hooks::Install()
 {
+	TCHAR szDllPath[MAX_PATH];
+	GetModuleFileName(NULL, szDllPath, MAX_PATH);
+	PathRemoveFileSpec(szDllPath);
+	PathCombine(szDllPath, szDllPath, BUILD(MT_DLL_NAME));
+
 	// Load hook DLL
-	HMODULE hModDLL = LoadLibrary(BUILD(MT_DLL_NAME));
+	HMODULE hModDLL = LoadLibrary(szDllPath);
 	if (!hModDLL)
 	{
 		return FALSE;

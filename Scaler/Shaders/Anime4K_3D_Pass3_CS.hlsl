@@ -1,0 +1,59 @@
+// Anime4K 3D Upscaler - Pass 3 (MIT License - bloc97/Anime4K)
+Texture2D<float4> InputTex : register(t0);
+Texture2D<float4> ConvTex : register(t1);
+RWTexture2D<float4> OutputTex2x : register(u0);
+
+SamplerState LinearSampler : register(s1);
+
+cbuffer ScalerCB : register(b0)
+{
+    float2 SourceSize;
+    float2 SourceOffset;
+    float2 TargetSize;
+    float2 TargetOffset;
+    float2 FullTargetSize;
+    float2 SourceTexSize;
+};
+
+[numthreads(16, 16, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)SourceSize.x || id.y >= (uint)SourceSize.y) return;
+
+    int2 base = int2(id.xy);
+    float4 src[3][3];
+    [unroll]
+    for (int y = -1; y <= 1; ++y)
+    {
+        [unroll]
+        for (int x = -1; x <= 1; ++x)
+        {
+            int2 p = clamp(base + int2(x, y), 0, int2(SourceSize) - 1);
+            src[x + 1][y + 1] = max(ConvTex.Load(int3(p, 0)), 0.0f);
+        }
+    }
+
+    float4 res = float4(-0.00016697648, -0.00015957489, 0.00017437353, -0.00019393339);
+    res += mul(src[0][0], float4x4(0.010651157, 0.0018537974, 0.0051580826, 0.0020901994, -0.41468114, -0.08517094, -0.04803197, 0.008413933, 0.014026587, 0.012820705, 0.01553548, 0.01283508, -0.040812977, -0.015933262, -0.01949977, -0.011502392));
+    res += mul(src[0][1], float4x4(0.2278103, 0.06374709, 0.062103115, 0.02010158, -0.01932597, 0.01159983, -0.35690293, -0.062822886, 0.29807624, 0.036038283, 0.028565003, -0.025969796, -0.24225195, -0.06635989, -0.06890857, -0.010140013));
+    res += mul(src[0][2], float4x4(-0.009164529, -0.0036277112, 0.19577485, 0.05511193, 0.025875263, 0.020616682, 0.02919653, 0.030669902, 0.00751339, -0.00551052, 0.2690018, 0.035395138, -0.013392302, -0.03666098, -0.23751089, -0.11222924));
+    res += mul(src[1][0], float4x4(0.017815048, 0.011143683, -0.002918766, -0.0042153858, -0.01929562, -0.3405707, 0.039267153, 0.0041966257, 0.0026771557, 0.009982735, 0.00087975257, 0.003984122, 0.0062404936, -0.04230462, 0.001981855, -0.0145921325));
+    res += mul(src[1][1], float4x4(-0.02615864, 0.2872578, 0.08103852, 0.11812216, -0.031988684, -0.08532163, -0.094653316, -0.42660478, 0.00077043264, 0.284553, -0.015517693, 0.036667597, 0.14234932, -0.20201443, -0.017204845, -0.111502305));
+    res += mul(src[1][2], float4x4(-0.11529456, -0.09024149, -0.2545015, 0.08581955, -0.020051582, -0.031601675, -0.031320736, -0.051691536, -0.019313173, 0.028963564, 0.017521648, 0.3159018, 0.179573, 0.19400181, 0.382411, 0.076367974));
+    res += mul(src[2][0], float4x4(-0.016741822, -0.001993879, -0.01517403, -0.010949569, 0.01859244, 0.042316843, 0.00025326485, -0.007079785, 0.001070783, 0.000911405, -0.0024269924, -0.0014501393, -0.01206317, 0.007300575, -0.0062582446, -0.0016001783));
+    res += mul(src[2][1], float4x4(-0.06300321, -0.20786348, 0.019603852, 0.020122321, 0.022107193, 0.036766138, 0.013046632, 0.02677947, -0.0006842017, -0.044024136, 0.0109439045, 0.0040129004, 0.009831765, 0.15807834, -0.05166107, -0.014462446));
+    res += mul(src[2][2], float4x4(-0.023205867, -0.049788095, -0.08251341, -0.26488927, 0.0029636251, 0.021618038, -0.0057556895, 0.018444102, 0.0064643323, -0.027886944, 0.010029941, -0.041902024, -0.021232832, -0.0072857663, 0.02056806, 0.18491453));
+
+    float2 invSrcTex = 1.0f / SourceTexSize;
+    float2 pBase = float2(id.xy) + SourceOffset;
+
+    float3 in00 = InputTex.SampleLevel(LinearSampler, (pBase + float2(0.25f, 0.25f)) * invSrcTex, 0).rgb;
+    float3 in10 = InputTex.SampleLevel(LinearSampler, (pBase + float2(0.75f, 0.25f)) * invSrcTex, 0).rgb;
+    float3 in01 = InputTex.SampleLevel(LinearSampler, (pBase + float2(0.25f, 0.75f)) * invSrcTex, 0).rgb;
+    float3 in11 = InputTex.SampleLevel(LinearSampler, (pBase + float2(0.75f, 0.75f)) * invSrcTex, 0).rgb;
+
+    OutputTex2x[id.xy * 2 + uint2(0, 0)] = float4(saturate(res.x + in00), 1.0f);
+    OutputTex2x[id.xy * 2 + uint2(1, 0)] = float4(saturate(res.y + in10), 1.0f);
+    OutputTex2x[id.xy * 2 + uint2(0, 1)] = float4(saturate(res.z + in01), 1.0f);
+    OutputTex2x[id.xy * 2 + uint2(1, 1)] = float4(saturate(res.w + in11), 1.0f);
+}

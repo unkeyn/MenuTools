@@ -3,42 +3,273 @@
 
 #include "MenuCommon/TrayIcon.h"
 
+#include <commctrl.h>
+#include <windowsx.h>
+
+#pragma comment(lib, "comctl32.lib")
+
 // Window information
 LONG wndOldWidth = -1;
 LONG wndOldHeight = -1;
 
+namespace
+{
+	constexpr UINT_PTR kHideTopSubclassId = 1;
+
+	DWORD GetScalerRegDword(LPCWSTR name, DWORD defaultVal)
+	{
+		HKEY hKey;
+		DWORD val = defaultVal;
+		if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\MenuTools", 0, KEY_QUERY_VALUE, &hKey) == ERROR_SUCCESS)
+		{
+			DWORD size = sizeof(val);
+			RegQueryValueExW(hKey, name, NULL, NULL, (LPBYTE)&val, &size);
+			RegCloseKey(hKey);
+		}
+		return val;
+	}
+
+	void SetScalerRegDword(LPCWSTR name, DWORD val)
+	{
+		HKEY hKey;
+		if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\MenuTools", 0, NULL, 0, KEY_SET_VALUE, NULL, &hKey, NULL) == ERROR_SUCCESS)
+		{
+			RegSetValueExW(hKey, name, 0, REG_DWORD, (const BYTE*)&val, sizeof(val));
+			RegCloseKey(hKey);
+		}
+	}
+
+#ifndef SM_CXPADDEDBORDER
+#define SM_CXPADDEDBORDER 92
+#endif
+
+	int GetMetric(HWND hWnd, int nIndex)
+	{
+		typedef UINT (WINAPI *GetDpiForWindow_t)(HWND);
+		typedef int (WINAPI *GetSystemMetricsForDpi_t)(int, UINT);
+
+		static auto pfnGetDpiForWindow = (GetDpiForWindow_t)GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow");
+		static auto pfnGetSystemMetricsForDpi = (GetSystemMetricsForDpi_t)GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetSystemMetricsForDpi");
+
+		if (pfnGetDpiForWindow && pfnGetSystemMetricsForDpi)
+		{
+			UINT dpi = pfnGetDpiForWindow(hWnd);
+			if (dpi != 0)
+			{
+				return pfnGetSystemMetricsForDpi(nIndex, dpi);
+			}
+		}
+		return GetSystemMetrics(nIndex);
+	}
+
+	LRESULT CALLBACK HideTopSubclassProc(
+		HWND hWnd,
+		UINT uMsg,
+		WPARAM wParam,
+		LPARAM lParam,
+		UINT_PTR uIdSubclass,
+		DWORD_PTR dwRefData)
+	{
+		UNREFERENCED_PARAMETER(dwRefData);
+
+		switch (uMsg)
+		{
+		case WM_NCCALCSIZE:
+		{
+			if (wParam == TRUE && lParam != 0)
+			{
+				auto* params = reinterpret_cast<NCCALCSIZE_PARAMS*>(lParam);
+
+				// Before default processing this is the proposed WINDOW rect.
+				const LONG windowTop = params->rgrc[0].top;
+
+				// Let the target application + Windows calculate its normal
+				// client rect first.
+				const LRESULT result = DefSubclassProc(hWnd, uMsg, wParam, lParam);
+
+				// Extend only the client area's TOP to the window edge.
+				// Left/right/bottom calculations remain untouched.
+				params->rgrc[0].top = windowTop;
+
+				return result;
+			}
+			break;
+		}
+
+		case WM_NCHITTEST:
+		{
+			const LRESULT hit = DefSubclassProc(hWnd, uMsg, wParam, lParam);
+
+			// Don't override application-specific hit testing.
+			if (hit != HTCLIENT)
+			{
+				return hit;
+			}
+
+			// Only emulate top resizing for genuinely resizable windows.
+			SetLastError(0);
+			const LONG_PTR style = GetWindowLongPtr(hWnd, GWL_STYLE);
+
+			if ((style == 0 && GetLastError() != 0) ||
+				!(style & WS_THICKFRAME) ||
+				IsZoomed(hWnd))
+			{
+				return hit;
+			}
+
+			RECT rc;
+			if (!GetWindowRect(hWnd, &rc))
+			{
+				return hit;
+			}
+
+			const POINT pt = {
+				GET_X_LPARAM(lParam),
+				GET_Y_LPARAM(lParam)
+			};
+
+			const int frameX =
+				GetMetric(hWnd, SM_CXSIZEFRAME) +
+				GetMetric(hWnd, SM_CXPADDEDBORDER);
+
+			const int frameY =
+				GetMetric(hWnd, SM_CYSIZEFRAME) +
+				GetMetric(hWnd, SM_CXPADDEDBORDER);
+
+			if (pt.y >= rc.top && pt.y < rc.top + frameY)
+			{
+				if (pt.x < rc.left + frameX)
+					return HTTOPLEFT;
+
+				if (pt.x >= rc.right - frameX)
+					return HTTOPRIGHT;
+
+				return HTTOP;
+			}
+
+			return hit;
+		}
+
+		case WM_NCDESTROY:
+		{
+			RemoveProp(hWnd, MT_PROP_ORIG_STYLE);
+			RemoveWindowSubclass(hWnd, HideTopSubclassProc, uIdSubclass);
+			return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+		}
+		}
+
+		return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+	}
+
+	BOOL EnableHideTop(HWND hWnd)
+	{
+		SetLastError(0);
+		const LONG_PTR curStyle = GetWindowLongPtr(hWnd, GWL_STYLE);
+		if (curStyle == 0 && GetLastError() != 0)
+		{
+			return FALSE;
+		}
+
+		if (!(curStyle & WS_CAPTION))
+		{
+			return FALSE;
+		}
+
+		if (!SetProp(hWnd, MT_PROP_ORIG_STYLE, (HANDLE)curStyle))
+		{
+			return FALSE;
+		}
+
+		if (!SetWindowSubclass(hWnd, HideTopSubclassProc, kHideTopSubclassId, 0))
+		{
+			RemoveProp(hWnd, MT_PROP_ORIG_STYLE);
+			return FALSE;
+		}
+
+		SetLastError(0);
+		const LONG_PTR oldStyle = SetWindowLongPtr(hWnd, GWL_STYLE, curStyle & ~WS_CAPTION);
+		if (oldStyle == 0 && GetLastError() != 0)
+		{
+			RemoveWindowSubclass(hWnd, HideTopSubclassProc, kHideTopSubclassId);
+			RemoveProp(hWnd, MT_PROP_ORIG_STYLE);
+			return FALSE;
+		}
+
+		if (!SetWindowPos(hWnd, NULL, 0, 0, 0, 0,
+				SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED))
+		{
+			// Rollback on SetWindowPos failure
+			SetLastError(0);
+			SetWindowLongPtr(hWnd, GWL_STYLE, curStyle);
+			RemoveWindowSubclass(hWnd, HideTopSubclassProc, kHideTopSubclassId);
+			RemoveProp(hWnd, MT_PROP_ORIG_STYLE);
+			return FALSE;
+		}
+
+		return TRUE;
+	}
+
+	BOOL DisableHideTop(HWND hWnd)
+	{
+		HANDLE hOldStyle = GetProp(hWnd, MT_PROP_ORIG_STYLE);
+		if (!hOldStyle)
+		{
+			return FALSE;
+		}
+
+		LONG_PTR origStyle = (LONG_PTR)hOldStyle;
+
+		SetLastError(0);
+		LONG_PTR curStyle = GetWindowLongPtr(hWnd, GWL_STYLE);
+		if (curStyle == 0 && GetLastError() != 0)
+		{
+			return FALSE;
+		}
+
+		if (!RemoveWindowSubclass(hWnd, HideTopSubclassProc, kHideTopSubclassId))
+		{
+			return FALSE;
+		}
+
+		SetLastError(0);
+		LONG_PTR result = SetWindowLongPtr(hWnd, GWL_STYLE, curStyle | (origStyle & WS_CAPTION));
+		if (result == 0 && GetLastError() != 0)
+		{
+			// Re-attach subclass to avoid inconsistent state
+			SetWindowSubclass(hWnd, HideTopSubclassProc, kHideTopSubclassId, 0);
+			return FALSE;
+		}
+
+		RemoveProp(hWnd, MT_PROP_ORIG_STYLE);
+		SetWindowPos(hWnd, NULL, 0, 0, 0, 0,
+			SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+
+		return TRUE;
+	}
+
+	HWND FindScalerController()
+	{
+		HWND hMT = FindWindowW(L"MENUTOOLS64", NULL);
+		if (!hMT)
+		{
+			hMT = FindWindowW(L"MENUTOOLS", NULL);
+		}
+		return hMT;
+	}
+}
+
 BOOL MenuTools::Install(HWND hWnd)
 {
 	// Visible window
-	if (!IsWindowVisible(hWnd))
+	if (!IsWindow(hWnd) || !IsWindowVisible(hWnd))
 	{
 		return FALSE;
 	}
 
 	HMENU hMenuSystem = GetSystemMenu(hWnd, FALSE);
-
-	if (!IsMenuItem(hMenuSystem, MT_MENU_PRIORITY))
+	if (!hMenuSystem)
 	{
-		HMENU hMenuPriority = CreateMenu();
-		AppendMenu(hMenuPriority, MF_BYCOMMAND | MF_ENABLED | MF_STRING, MT_MENU_PRIORITY_REALTIME, _T("&Realtime"));
-		AppendMenu(hMenuPriority, MF_BYCOMMAND | MF_ENABLED | MF_STRING, MT_MENU_PRIORITY_HIGH, _T("&High"));
-		AppendMenu(hMenuPriority, MF_BYCOMMAND | MF_ENABLED | MF_STRING, MT_MENU_PRIORITY_ABOVE_NORMAL, _T("&Above normal"));
-		AppendMenu(hMenuPriority, MF_BYCOMMAND | MF_ENABLED | MF_STRING, MT_MENU_PRIORITY_NORMAL, _T("&Normal"));
-		AppendMenu(hMenuPriority, MF_BYCOMMAND | MF_ENABLED | MF_STRING, MT_MENU_PRIORITY_BELOW_NORMAL, _T("&Below normal"));
-		AppendMenu(hMenuPriority, MF_BYCOMMAND | MF_ENABLED | MF_STRING, MT_MENU_PRIORITY_LOW, _T("&Low"));
-		InsertSubMenu(hMenuSystem, hMenuPriority, SC_CLOSE, MF_BYCOMMAND | MF_POPUP, MT_MENU_PRIORITY, _T("&Priority"));
-	}
-
-	if (!IsMenuItem(hMenuSystem, MT_MENU_TRANSPARENCY))
-	{
-		HMENU hMenuTransparency = CreateMenu();
-		AppendMenu(hMenuTransparency, MF_BYCOMMAND | MF_ENABLED | MF_STRING, MT_MENU_TRANSPARENCY_0, _T("&0% (Opaque)"));
-		AppendMenu(hMenuTransparency, MF_BYCOMMAND | MF_ENABLED | MF_STRING, MT_MENU_TRANSPARENCY_10, _T("&10%"));
-		AppendMenu(hMenuTransparency, MF_BYCOMMAND | MF_ENABLED | MF_STRING, MT_MENU_TRANSPARENCY_20, _T("&20%"));
-		AppendMenu(hMenuTransparency, MF_BYCOMMAND | MF_ENABLED | MF_STRING, MT_MENU_TRANSPARENCY_30, _T("&30%"));
-		AppendMenu(hMenuTransparency, MF_BYCOMMAND | MF_ENABLED | MF_STRING, MT_MENU_TRANSPARENCY_40, _T("&40%"));
-		AppendMenu(hMenuTransparency, MF_BYCOMMAND | MF_ENABLED | MF_STRING, MT_MENU_TRANSPARENCY_50, _T("&50%"));
-		InsertSubMenu(hMenuSystem, hMenuTransparency, SC_CLOSE, MF_BYCOMMAND | MF_POPUP, MT_MENU_TRANSPARENCY, _T("&Transparency"));
+		return FALSE;
 	}
 
 	if (!IsMenuItem(hMenuSystem, MT_MENU_ALWAYS_ON_TOP))
@@ -46,10 +277,44 @@ BOOL MenuTools::Install(HWND hWnd)
 		InsertMenu(hMenuSystem, SC_CLOSE, MF_BYCOMMAND | MF_STRING, MT_MENU_ALWAYS_ON_TOP, _T("&Always on Top"));
 	}
 
+	if (!IsMenuItem(hMenuSystem, MT_MENU_HIDE_TOP))
+	{
+		InsertMenu(hMenuSystem, SC_CLOSE, MF_BYCOMMAND | MF_STRING, MT_MENU_HIDE_TOP, _T("&Hide top"));
+	}
+
 	if (!IsMenuItem(hMenuSystem, MT_MENU_MINIMIZE_TO_TRAY))
 	{
 		InsertMenu(hMenuSystem, SC_CLOSE, MF_BYCOMMAND | MF_STRING, MT_MENU_MINIMIZE_TO_TRAY, _T("Minimi&ze to Tray"));
 
+	}
+
+	// Fullscreen Submenu
+	bool hasFullscreen = false;
+	int count = GetMenuItemCount(hMenuSystem);
+	for (int i = 0; i < count; ++i)
+	{
+		HMENU hSub = GetSubMenu(hMenuSystem, i);
+		if (hSub && (IsMenuItem(hSub, MT_MENU_FULLSCREEN_NEAREST) || IsMenuItem(hSub, MT_MENU_FULLSCREEN_BICUBIC)))
+		{
+			hasFullscreen = true;
+			break;
+		}
+	}
+
+	if (!hasFullscreen)
+	{
+		HMENU hSubMenu = CreatePopupMenu();
+		AppendMenu(hSubMenu, MF_STRING, MT_MENU_FULLSCREEN_NEAREST, _T("Nearest Neighbor"));
+		AppendMenu(hSubMenu, MF_STRING, MT_MENU_FULLSCREEN_BICUBIC, _T("Bicubic"));
+		AppendMenu(hSubMenu, MF_STRING, MT_MENU_FULLSCREEN_LANCZOS, _T("Lanczos"));
+		AppendMenu(hSubMenu, MF_STRING, MT_MENU_FULLSCREEN_FSR, _T("FSR"));
+		AppendMenu(hSubMenu, MF_STRING, MT_MENU_FULLSCREEN_ANIME4K_3D, _T("Anime4K 3D"));
+		AppendMenu(hSubMenu, MF_STRING, MT_MENU_FULLSCREEN_ANIME4K_3D_AA, _T("Anime4K 3D AA"));
+		AppendMenu(hSubMenu, MF_SEPARATOR, 0, NULL);
+		AppendMenu(hSubMenu, MF_STRING, MT_MENU_FULLSCREEN_ASPECT_RATIO, _T("Preserve aspect ratio"));
+		AppendMenu(hSubMenu, MF_STRING, MT_MENU_FULLSCREEN_EXIT, _T("Exit Fullscreen"));
+
+		InsertMenu(hMenuSystem, SC_CLOSE, MF_BYCOMMAND | MF_POPUP, (UINT_PTR)hSubMenu, _T("&Fullscreen"));
 	}
 
 	if (!IsMenuItem(hMenuSystem, MT_MENU_SEPARATOR))
@@ -62,20 +327,28 @@ BOOL MenuTools::Install(HWND hWnd)
 
 BOOL MenuTools::Uninstall(HWND hWnd)
 {
+	if (!IsWindow(hWnd))
+	{
+		return FALSE;
+	}
+
 	BOOL bSuccess = TRUE;
 
+	// Restore window caption and remove subclass if top was hidden
+	DisableHideTop(hWnd);
+
 	HMENU hMenuSystem = GetSystemMenu(hWnd, FALSE);
+	if (!hMenuSystem)
+	{
+		return bSuccess;
+	}
 
 	// Delete Menu Tools
-	if (!DeleteMenu(hMenuSystem, MT_MENU_PRIORITY, MF_BYCOMMAND))
-	{
-		bSuccess = FALSE;
-	}
-	if (!DeleteMenu(hMenuSystem, MT_MENU_TRANSPARENCY, MF_BYCOMMAND))
-	{
-		bSuccess = FALSE;
-	}
 	if (!DeleteMenu(hMenuSystem, MT_MENU_ALWAYS_ON_TOP, MF_BYCOMMAND))
+	{
+		bSuccess = FALSE;
+	}
+	if (!DeleteMenu(hMenuSystem, MT_MENU_HIDE_TOP, MF_BYCOMMAND))
 	{
 		bSuccess = FALSE;
 	}
@@ -83,6 +356,20 @@ BOOL MenuTools::Uninstall(HWND hWnd)
 	{
 		bSuccess = FALSE;
 	}
+
+	// Delete Fullscreen Submenu
+	int count = GetMenuItemCount(hMenuSystem);
+	for (int i = 0; i < count; ++i)
+	{
+		HMENU hSub = GetSubMenu(hMenuSystem, i);
+		if (hSub && (IsMenuItem(hSub, MT_MENU_FULLSCREEN_NEAREST) || IsMenuItem(hSub, MT_MENU_FULLSCREEN_BICUBIC)))
+		{
+			RemoveMenu(hMenuSystem, i, MF_BYPOSITION);
+			DestroyMenu(hSub);
+			break;
+		}
+	}
+
 	if (!DeleteMenu(hMenuSystem, MT_MENU_SEPARATOR, MF_BYCOMMAND))
 	{
 		bSuccess = FALSE;
@@ -93,83 +380,16 @@ BOOL MenuTools::Uninstall(HWND hWnd)
 
 VOID MenuTools::Status(HWND hWnd)
 {
+	if (!IsWindow(hWnd))
+	{
+		return;
+	}
+
 	HMENU hMenuSystem = GetSystemMenu(hWnd, FALSE);
-
-	// Priority
-	HANDLE hProcess = GetCurrentProcess();
-
-	DWORD dwPriority = GetPriorityClass(hProcess);
-	switch (dwPriority)
+	if (!hMenuSystem)
 	{
-	case REALTIME_PRIORITY_CLASS:
-	{
-		CheckMenuRadioItem(hMenuSystem, MT_MENU_PRIORITY_REALTIME, MT_MENU_PRIORITY_LOW, MT_MENU_PRIORITY_REALTIME, MF_BYCOMMAND);
-		break;
+		return;
 	}
-	case HIGH_PRIORITY_CLASS:
-	{
-		CheckMenuRadioItem(hMenuSystem, MT_MENU_PRIORITY_REALTIME, MT_MENU_PRIORITY_LOW, MT_MENU_PRIORITY_HIGH, MF_BYCOMMAND);
-		break;
-	}
-	case ABOVE_NORMAL_PRIORITY_CLASS:
-	{
-		CheckMenuRadioItem(hMenuSystem, MT_MENU_PRIORITY_REALTIME, MT_MENU_PRIORITY_LOW, MT_MENU_PRIORITY_ABOVE_NORMAL, MF_BYCOMMAND);
-		break;
-	}
-	case NORMAL_PRIORITY_CLASS:
-	default:
-	{
-		CheckMenuRadioItem(hMenuSystem, MT_MENU_PRIORITY_REALTIME, MT_MENU_PRIORITY_LOW, MT_MENU_PRIORITY_NORMAL, MF_BYCOMMAND);
-		break;
-	}
-	case BELOW_NORMAL_PRIORITY_CLASS:
-	{
-		CheckMenuRadioItem(hMenuSystem, MT_MENU_PRIORITY_REALTIME, MT_MENU_PRIORITY_LOW, MT_MENU_PRIORITY_BELOW_NORMAL, MF_BYCOMMAND);
-		break;
-	}
-	case IDLE_PRIORITY_CLASS:
-	{
-		CheckMenuRadioItem(hMenuSystem, MT_MENU_PRIORITY_REALTIME, MT_MENU_PRIORITY_LOW, MT_MENU_PRIORITY_LOW, MF_BYCOMMAND);
-		break;
-	}
-	}
-
-	// Transparency
-	UINT uLevel = MT_MENU_TRANSPARENCY_0;
-	COLORREF crKey;
-	BYTE bAlpha;
-	DWORD dwFlags;
-	if (GetLayeredWindowAttributes(hWnd, &crKey, &bAlpha, &dwFlags))
-	{
-		if (crKey == 0 && dwFlags == LWA_ALPHA)
-		{
-			if (bAlpha > 229)
-			{
-				uLevel = MT_MENU_TRANSPARENCY_0;
-			}
-			else if (bAlpha > 204)
-			{
-				uLevel = MT_MENU_TRANSPARENCY_10;
-			}
-			else if (bAlpha > 178)
-			{
-				uLevel = MT_MENU_TRANSPARENCY_20;
-			}
-			else if (bAlpha > 153)
-			{
-				uLevel = MT_MENU_TRANSPARENCY_30;
-			}
-			else if (bAlpha > 127)
-			{
-				uLevel = MT_MENU_TRANSPARENCY_40;
-			}
-			else
-			{
-				uLevel = MT_MENU_TRANSPARENCY_50;
-			}
-		}
-	}
-	CheckMenuRadioItem(hMenuSystem, MT_MENU_TRANSPARENCY_0, MT_MENU_TRANSPARENCY_100, uLevel, MF_BYCOMMAND);
 
 	// Always on Top
 	if (GetWindowLongPtr(hWnd, GWL_EXSTYLE) & WS_EX_TOPMOST)
@@ -181,6 +401,16 @@ VOID MenuTools::Status(HWND hWnd)
 		CheckMenuItem(hMenuSystem, MT_MENU_ALWAYS_ON_TOP, MF_BYCOMMAND | MF_UNCHECKED);
 	}
 
+	// Hide top
+	if (GetProp(hWnd, MT_PROP_ORIG_STYLE) != NULL)
+	{
+		CheckMenuItem(hMenuSystem, MT_MENU_HIDE_TOP, MF_BYCOMMAND | MF_CHECKED);
+	}
+	else
+	{
+		CheckMenuItem(hMenuSystem, MT_MENU_HIDE_TOP, MF_BYCOMMAND | MF_UNCHECKED);
+	}
+
 	// Minimize to Tray
 	if (mTrays.count(hWnd))
 	{
@@ -189,6 +419,59 @@ VOID MenuTools::Status(HWND hWnd)
 	else
 	{
 		CheckMenuItem(hMenuSystem, MT_MENU_MINIMIZE_TO_TRAY, MF_BYCOMMAND | MF_UNCHECKED);
+	}
+
+	// Fullscreen Submenu Status
+	int count = GetMenuItemCount(hMenuSystem);
+	for (int i = 0; i < count; ++i)
+	{
+		HMENU hSub = GetSubMenu(hMenuSystem, i);
+		if (hSub && (IsMenuItem(hSub, MT_MENU_FULLSCREEN_NEAREST) || IsMenuItem(hSub, MT_MENU_FULLSCREEN_BICUBIC)))
+		{
+			DWORD filterId = GetScalerRegDword(L"ScalerFilter", MT_SCALER_FILTER_BICUBIC);
+			DWORD preserveAspect = GetScalerRegDword(L"PreserveAspect", 1);
+
+			if (filterId > MT_SCALER_FILTER_NEAREST)
+			{
+				filterId = MT_SCALER_FILTER_BICUBIC;
+			}
+
+			UINT radioPos = 1;
+			switch (filterId)
+			{
+			case MT_SCALER_FILTER_NEAREST: radioPos = 0; break;
+			case MT_SCALER_FILTER_BICUBIC: radioPos = 1; break;
+			case MT_SCALER_FILTER_LANCZOS: radioPos = 2; break;
+			case MT_SCALER_FILTER_FSR: radioPos = 3; break;
+			case MT_SCALER_FILTER_ANIME4K_3D: radioPos = 4; break;
+			case MT_SCALER_FILTER_ANIME4K_3D_AA: radioPos = 5; break;
+			default: radioPos = 1; break;
+			}
+
+			CheckMenuRadioItem(hSub, 0, 5, radioPos, MF_BYPOSITION);
+
+			CheckMenuItem(hSub, MT_MENU_FULLSCREEN_ASPECT_RATIO,
+				MF_BYCOMMAND | (preserveAspect ? MF_CHECKED : MF_UNCHECKED));
+
+			BOOL isScaled = (GetProp(hWnd, MT_PROP_SCALED) != NULL);
+			if (isScaled)
+			{
+				HANDLE hMutex = OpenMutexW(SYNCHRONIZE, FALSE, MT_SCALER_MUTEX_NAME);
+				if (!hMutex)
+				{
+					RemovePropW(hWnd, MT_PROP_SCALED);
+					isScaled = FALSE;
+				}
+				else
+				{
+					CloseHandle(hMutex);
+				}
+			}
+			EnableMenuItem(hSub, MT_MENU_FULLSCREEN_EXIT,
+				MF_BYCOMMAND | (isScaled ? MF_ENABLED : MF_GRAYED));
+
+			break;
+		}
 	}
 
 	return;
@@ -224,94 +507,11 @@ BOOL MenuTools::WndProc(HWND hWnd, WPARAM wParam, LPARAM lParam)
 {
 	UNREFERENCED_PARAMETER(lParam);
 
-	int wmId = wParam & 0xFFF0;
+	int wmId = (int)(wParam & 0xFFFF);
 
 	// Handle menu messages
 	switch (wmId)
 	{
-		// Priority
-	case MT_MENU_PRIORITY_REALTIME:
-	case MT_MENU_PRIORITY_HIGH:
-	case MT_MENU_PRIORITY_ABOVE_NORMAL:
-	case MT_MENU_PRIORITY_NORMAL:
-	case MT_MENU_PRIORITY_BELOW_NORMAL:
-	case MT_MENU_PRIORITY_LOW:
-	{
-		HANDLE hProcess = GetCurrentProcess();
-		switch (wmId)
-		{
-		case MT_MENU_PRIORITY_REALTIME:
-			SetPriorityClass(hProcess, REALTIME_PRIORITY_CLASS);
-			break;
-		case MT_MENU_PRIORITY_HIGH:
-			SetPriorityClass(hProcess, HIGH_PRIORITY_CLASS);
-			break;
-		case MT_MENU_PRIORITY_ABOVE_NORMAL:
-			SetPriorityClass(hProcess, ABOVE_NORMAL_PRIORITY_CLASS);
-			break;
-		default:
-		case MT_MENU_PRIORITY_NORMAL:
-			SetPriorityClass(hProcess, NORMAL_PRIORITY_CLASS);
-			break;
-		case MT_MENU_PRIORITY_BELOW_NORMAL:
-			SetPriorityClass(hProcess, BELOW_NORMAL_PRIORITY_CLASS);
-			break;
-		case MT_MENU_PRIORITY_LOW:
-			SetPriorityClass(hProcess, IDLE_PRIORITY_CLASS);
-			break;
-		}
-
-		return TRUE;
-	}
-		// Transparency
-	case MT_MENU_TRANSPARENCY_0:
-	case MT_MENU_TRANSPARENCY_10:
-	case MT_MENU_TRANSPARENCY_20:
-	case MT_MENU_TRANSPARENCY_30:
-	case MT_MENU_TRANSPARENCY_40:
-	case MT_MENU_TRANSPARENCY_50:
-	{
-		BYTE level;
-		switch (wmId)
-		{
-		default:
-		case MT_MENU_TRANSPARENCY_0:
-			level = 0;
-			break;
-		case MT_MENU_TRANSPARENCY_10:
-			level = 10;
-			break;
-		case MT_MENU_TRANSPARENCY_20:
-			level = 20;
-			break;
-		case MT_MENU_TRANSPARENCY_30:
-			level = 30;
-			break;
-		case MT_MENU_TRANSPARENCY_40:
-			level = 40;
-			break;
-		case MT_MENU_TRANSPARENCY_50:
-			level = 50;
-			break;
-		}
-
-		if (level)
-		{
-			// Set WS_EX_LAYERED on this window 
-			SetWindowLongPtr(hWnd, GWL_EXSTYLE, GetWindowLongPtr(hWnd, GWL_EXSTYLE) | WS_EX_LAYERED);
-			// Make this window % alpha
-			SetLayeredWindowAttributes(hWnd, NULL, (255 * (100 - level)) / 100, LWA_ALPHA);
-		}
-		else
-		{
-			// Remove WS_EX_LAYERED from this window styles
-			SetWindowLongPtr(hWnd, GWL_EXSTYLE, GetWindowLongPtr(hWnd, GWL_EXSTYLE) & ~WS_EX_LAYERED);
-			// Ask the window and its children to repaint
-			RedrawWindow(hWnd, NULL, NULL, RDW_ERASE | RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN);
-		}
-
-		return TRUE;
-	}
 		// Always On Top
 	case MT_MENU_ALWAYS_ON_TOP:
 	{
@@ -324,6 +524,19 @@ BOOL MenuTools::WndProc(HWND hWnd, WPARAM wParam, LPARAM lParam)
 		{
 			// Remove
 			SetWindowPos(hWnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+		}
+		return TRUE;
+	}
+		// Hide top
+	case MT_MENU_HIDE_TOP:
+	{
+		if (GetProp(hWnd, MT_PROP_ORIG_STYLE))
+		{
+			DisableHideTop(hWnd);
+		}
+		else
+		{
+			EnableHideTop(hWnd);
 		}
 		return TRUE;
 	}
@@ -359,28 +572,75 @@ BOOL MenuTools::WndProc(HWND hWnd, WPARAM wParam, LPARAM lParam)
 
 		return TRUE;
 	}
+	case MT_MENU_FULLSCREEN_NEAREST:
+	case MT_MENU_FULLSCREEN_BICUBIC:
+	case MT_MENU_FULLSCREEN_LANCZOS:
+	case MT_MENU_FULLSCREEN_FSR:
+	case MT_MENU_FULLSCREEN_ANIME4K_3D:
+	case MT_MENU_FULLSCREEN_ANIME4K_3D_AA:
+	{
+		DWORD filter = MT_SCALER_FILTER_BICUBIC;
+		switch (wmId)
+		{
+		case MT_MENU_FULLSCREEN_NEAREST:
+			filter = MT_SCALER_FILTER_NEAREST;
+			break;
+		case MT_MENU_FULLSCREEN_BICUBIC:
+			filter = MT_SCALER_FILTER_BICUBIC;
+			break;
+		case MT_MENU_FULLSCREEN_LANCZOS:
+			filter = MT_SCALER_FILTER_LANCZOS;
+			break;
+		case MT_MENU_FULLSCREEN_FSR:
+			filter = MT_SCALER_FILTER_FSR;
+			break;
+		case MT_MENU_FULLSCREEN_ANIME4K_3D:
+			filter = MT_SCALER_FILTER_ANIME4K_3D;
+			break;
+		case MT_MENU_FULLSCREEN_ANIME4K_3D_AA:
+			filter = MT_SCALER_FILTER_ANIME4K_3D_AA;
+			break;
+		}
+		SetScalerRegDword(L"ScalerFilter", filter);
+
+		HWND hMT = FindScalerController();
+		if (hMT)
+		{
+			UINT msg = RegisterWindowMessageW(MT_MSG_SCALER_NAME);
+			PostMessageW(hMT, msg, MT_SCALER_CMD_START, (LPARAM)hWnd);
+		}
+		return TRUE;
+	}
+	case MT_MENU_FULLSCREEN_ASPECT_RATIO:
+	{
+		DWORD preserveAspect = GetScalerRegDword(L"PreserveAspect", 1);
+		preserveAspect = preserveAspect ? 0 : 1;
+		SetScalerRegDword(L"PreserveAspect", preserveAspect);
+
+		HWND hMT = FindScalerController();
+		if (hMT)
+		{
+			UINT msg = RegisterWindowMessageW(MT_MSG_SCALER_NAME);
+			PostMessageW(hMT, msg, MT_SCALER_CMD_TOGGLE_ASPECT, (LPARAM)hWnd);
+		}
+		return TRUE;
+	}
+	case MT_MENU_FULLSCREEN_EXIT:
+	{
+		HWND hMT = FindScalerController();
+		if (hMT)
+		{
+			UINT msg = RegisterWindowMessageW(MT_MSG_SCALER_NAME);
+			PostMessageW(hMT, msg, MT_SCALER_CMD_STOP, (LPARAM)hWnd);
+		}
+		return TRUE;
+	}
 	}
 
 	return FALSE;
 }
 
 // Helpers
-BOOL InsertSubMenu(HMENU hMenu, HMENU hSubMenu, UINT uPosition, UINT uFlags, UINT uIDNewItem, LPCWSTR lpNewItem)
-{
-	if (InsertMenu(hMenu, uPosition, uFlags, (UINT_PTR)hSubMenu, lpNewItem))
-	{
-		MENUITEMINFO mmi;
-		ZeroMemory(&mmi, sizeof(MENUITEMINFO));
-		mmi.cbSize = sizeof(MENUITEMINFO);
-		mmi.fMask = MIIM_ID;
-		mmi.wID = uIDNewItem;
-
-		return SetMenuItemInfo(hMenu, (UINT)hSubMenu, FALSE, &mmi);
-	}
-
-	return FALSE;
-}
-
 BOOL IsMenuItem(HMENU hMenu, UINT item)
 {
 	MENUITEMINFO mmi;

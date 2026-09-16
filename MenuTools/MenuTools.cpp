@@ -5,14 +5,186 @@
 #include "MenuTools.h"
 #include "Hooks.h"
 #include "Startup.h"
+#include "TaskbarVolume.h"
 
 #include "MenuCommon/TrayIcon.h"
+#include <shlwapi.h>
+#include <stdio.h>
+
+#pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "advapi32.lib")
 
 #define MAX_LOADSTRING 100
 
+#ifndef MOD_NOREPEAT
+#define MOD_NOREPEAT 0x4000
+#endif
+
+#ifndef MSGFLT_ALLOW
+#define MSGFLT_ALLOW 1
+#endif
+
 // Global Variables:
-HINSTANCE hInst;								// current instance
-HWND hWnd;										// current window handle
+HINSTANCE hInst = NULL;							// current instance
+HWND hWnd = NULL;								// current window handle
+
+// Scaler Globals
+static HANDLE g_hScalerProcess = NULL;
+static HWND g_ScaledHWnd = NULL;
+static UINT g_uMsgScaler = 0;
+
+static bool IsScalerManager()
+{
+#ifdef _WIN64
+	return true;
+#else
+	BOOL bIsWOW64 = FALSE;
+	if (IsWow64Process(GetCurrentProcess(), &bIsWOW64) && bIsWOW64)
+	{
+		return false; // 32-bit on 64-bit Windows: delegate to MenuTools64.exe
+	}
+	return true; // pure 32-bit Windows: MenuTools.exe is the manager
+#endif
+}
+
+static DWORD GetScalerRegDword(LPCWSTR name, DWORD defaultVal)
+{
+	HKEY hKey;
+	DWORD val = defaultVal;
+	if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\MenuTools", 0, KEY_QUERY_VALUE, &hKey) == ERROR_SUCCESS)
+	{
+		DWORD size = sizeof(val);
+		RegQueryValueExW(hKey, name, NULL, NULL, (LPBYTE)&val, &size);
+		RegCloseKey(hKey);
+	}
+	return val;
+}
+
+static bool IsScalerActive()
+{
+	HANDLE h = OpenMutexW(SYNCHRONIZE, FALSE, MT_SCALER_MUTEX_NAME);
+	if (!h)
+		return false;
+	CloseHandle(h);
+	return true;
+}
+
+static void StopScaler()
+{
+	// Signal exit event (created by scaler)
+	HANDLE hExit = OpenEventW(EVENT_MODIFY_STATE, FALSE, MT_SCALER_EXIT_EVENT_NAME);
+	if (hExit)
+	{
+		SetEvent(hExit);
+		CloseHandle(hExit);
+	}
+
+	// Wait on the owned scaler process handle
+	if (g_hScalerProcess)
+	{
+		if (WaitForSingleObject(g_hScalerProcess, 1500) == WAIT_TIMEOUT)
+		{
+			TerminateProcess(g_hScalerProcess, 0);
+		}
+		CloseHandle(g_hScalerProcess);
+		g_hScalerProcess = NULL;
+	}
+	else if (IsScalerActive())
+	{
+		DWORD start = GetTickCount();
+		while (IsScalerActive() && (GetTickCount() - start < 1500))
+		{
+			Sleep(50);
+		}
+	}
+
+	if (g_ScaledHWnd && IsWindow(g_ScaledHWnd))
+	{
+		RemovePropW(g_ScaledHWnd, MT_PROP_SCALED);
+		g_ScaledHWnd = NULL;
+	}
+}
+
+static void StartScaler(HWND targetHWnd)
+{
+	if (!IsScalerManager()) return;
+	if (!IsWindow(targetHWnd)) return;
+
+	StopScaler();
+
+	int retries = 20;
+	while (IsScalerActive() && --retries > 0)
+	{
+		Sleep(50);
+	}
+
+	DWORD targetPid = 0;
+	GetWindowThreadProcessId(targetHWnd, &targetPid);
+	if (!targetPid) return;
+
+	DWORD filterId = GetScalerRegDword(L"ScalerFilter", MT_SCALER_FILTER_BICUBIC);
+	DWORD preserveAspect = GetScalerRegDword(L"PreserveAspect", 1);
+
+	wchar_t szExeDir[MAX_PATH];
+	GetModuleFileNameW(NULL, szExeDir, MAX_PATH);
+	PathRemoveFileSpecW(szExeDir);
+
+	wchar_t szScalerPath[MAX_PATH];
+	PathCombineW(szScalerPath, szExeDir, MT_SCALER_EXE_NAME);
+
+	if (GetFileAttributesW(szScalerPath) == INVALID_FILE_ATTRIBUTES)
+	{
+		PathCombineW(szScalerPath, szExeDir, L"Scaler\\MenuToolsScaler.exe");
+	}
+
+	if (GetFileAttributesW(szScalerPath) == INVALID_FILE_ATTRIBUTES)
+	{
+		return;
+	}
+
+	wchar_t szCmd[MAX_PATH * 2];
+	swprintf_s(szCmd, MAX_PATH * 2, L"\"%ls\" %p %lu %lu %lu", szScalerPath, targetHWnd, targetPid, filterId, preserveAspect);
+
+	STARTUPINFOW si = { sizeof(si) };
+	PROCESS_INFORMATION pi = { 0 };
+	if (CreateProcessW(szScalerPath, szCmd, NULL, NULL, FALSE, 0, NULL, szExeDir, &si, &pi))
+	{
+		CloseHandle(pi.hThread);
+		g_hScalerProcess = pi.hProcess;
+		g_ScaledHWnd = targetHWnd;
+	}
+}
+
+static void OnScalerHotkey()
+{
+	if (!IsScalerManager()) return;
+
+	if (IsScalerActive())
+	{
+		StopScaler();
+		return;
+	}
+
+	HWND fg = GetForegroundWindow();
+	if (!fg || fg == hWnd || fg == GetDesktopWindow()) return;
+
+	HWND hTray = FindWindowW(L"Shell_TrayWnd", NULL);
+	if (fg == hTray) return;
+
+	HWND hProgman = FindWindowW(L"Progman", NULL);
+	if (fg == hProgman) return;
+
+	HWND hWorker = FindWindowW(L"WorkerW", NULL);
+	if (fg == hWorker) return;
+
+	DWORD fgPid = 0;
+	GetWindowThreadProcessId(fg, &fgPid);
+	if (fgPid == GetCurrentProcessId()) return;
+
+	StartScaler(fg);
+}
+
+// Global Variables (Title/Class):
 TCHAR szTitle[MAX_LOADSTRING];					// The title bar text
 TCHAR szWindowClass[MAX_LOADSTRING];			// the main window class name
 UINT uTrayId;
@@ -46,16 +218,13 @@ int APIENTRY _tWinMain(_In_ HINSTANCE hInstance,
 	}
 
 	// Initialize global strings
-	BOOL bIsWOW64;
-	if (IsWow64Process(GetCurrentProcess(), &bIsWOW64))
-	{
-		LoadString(hInstance, bIsWOW64 ? IDS_APP_TITLE64 : IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
-	}
-	else
-	{
-		LoadString(hInstance, BUILD(IDS_APP_TITLE), szTitle, MAX_LOADSTRING);
-	}
+#ifdef _WIN64
+	LoadString(hInstance, IDS_APP_TITLE64, szTitle, MAX_LOADSTRING);
+	lstrcpyW(szWindowClass, L"MENUTOOLS64");
+#else
+	LoadString(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
 	LoadString(hInstance, IDC_MENUTOOLS, szWindowClass, MAX_LOADSTRING);
+#endif
 	MyRegisterClass(hInstance);
 
 	// Perform application initialization:
@@ -64,17 +233,29 @@ int APIENTRY _tWinMain(_In_ HINSTANCE hInstance,
 		return FALSE;
 	}
 
+	// Register Scaler IPC message in all instances
+	g_uMsgScaler = RegisterWindowMessageW(MT_MSG_SCALER_NAME);
+
+	// Register Scaler IPC and Hotkey (only in the designated scaler manager process)
+	if (IsScalerManager())
+	{
+		typedef BOOL (WINAPI *pfnChangeWindowMessageFilterEx)(HWND, UINT, DWORD, PVOID);
+		pfnChangeWindowMessageFilterEx pfnFilter = (pfnChangeWindowMessageFilterEx)GetProcAddress(GetModuleHandleW(L"user32.dll"), "ChangeWindowMessageFilterEx");
+		if (pfnFilter)
+		{
+			pfnFilter(hWnd, g_uMsgScaler, MSGFLT_ALLOW, NULL);
+		}
+		if (!RegisterHotKey(hWnd, MT_HOTKEY_SCALER_ID, MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, 'A'))
+		{
+			RegisterHotKey(hWnd, MT_HOTKEY_SCALER_ID, MOD_ALT | MOD_SHIFT, 'A');
+		}
+	}
+
 #ifndef _WIN64
 	// Create tray icon
 	TrayIcon tray(hWnd);
 	tray.SetCallBackMessage(MT_TRAY_MESSAGE);
 	uTrayId = tray.Show();
-	if (!uTrayId)
-	{
-		// TODO: L10n
-		MessageBox(hWnd, _T("Failed to create tray icon!"), szTitle, MB_OK);
-		return FALSE;
-	}
 
 	// Hide it...
 	if (startup.flags & Startup::HIDE_TRAY)
@@ -87,10 +268,19 @@ int APIENTRY _tWinMain(_In_ HINSTANCE hInstance,
 	Hooks hooks;
 	if (!hooks.Install())
 	{
-		// TODO: L10n
-		MessageBox(hWnd, _T("Failed to install hooks!"), szTitle, MB_OK);
 		return FALSE;
 	}
+
+	// Install taskbar volume hook
+#ifdef _WIN64
+	TaskbarVolume::Install(hWnd);
+#else
+	BOOL bIsWOW64Taskbar = FALSE;
+	if (IsWow64Process(GetCurrentProcess(), &bIsWOW64Taskbar) && !bIsWOW64Taskbar)
+	{
+		TaskbarVolume::Install(hWnd);
+	}
+#endif
 
 	// Main message loop:
 	MSG msg;
@@ -98,6 +288,13 @@ int APIENTRY _tWinMain(_In_ HINSTANCE hInstance,
 	{
 		TranslateMessage(&msg);
 		DispatchMessage(&msg);
+	}
+
+	TaskbarVolume::Uninstall();
+	if (IsScalerManager())
+	{
+		UnregisterHotKey(hWnd, MT_HOTKEY_SCALER_ID);
+		StopScaler();
 	}
 
 	return (int)msg.wParam;
@@ -146,11 +343,18 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
 	hInst = hInstance; // Store instance handle in our global variable
 
 	hWnd = CreateWindow(szWindowClass, szTitle, WS_OVERLAPPEDWINDOW,
-		CW_USEDEFAULT, 0, 0, 0, NULL, NULL, NULL, NULL);
+		CW_USEDEFAULT, 0, 0, 0, NULL, NULL, hInstance, NULL);
 
 	if (!hWnd)
 	{
 		return FALSE;
+	}
+
+	FILE* f = _wfopen(L"C:\\Program Files\\MenuTools\\hwnd.txt", L"a");
+	if (f) {
+		fwprintf(f, L"PID=%lu, x%d, hWnd=%p, Class='%ls', Title='%ls'\n",
+			GetCurrentProcessId(), (int)(sizeof(void*) * 8), hWnd, szWindowClass, szTitle);
+		fclose(f);
 	}
 
 	ShowWindow(hWnd, nCmdShow);
@@ -216,10 +420,57 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			return DefWindowProc(hWnd, message, wParam, lParam);
 		}
 		break;
+	case WM_TASKBAR_VOLUME_WHEEL:
+	case WM_TASKBAR_VOLUME_MUTE:
+		TaskbarVolume::OnVolumeMessage(message, wParam, lParam);
+		break;
+	case WM_HOTKEY:
+		if (wParam == MT_HOTKEY_SCALER_ID && IsScalerManager())
+		{
+			OnScalerHotkey();
+		}
+		break;
 	case WM_DESTROY:
+		TaskbarVolume::Uninstall();
+		if (IsScalerManager())
+		{
+			UnregisterHotKey(hWnd, MT_HOTKEY_SCALER_ID);
+			StopScaler();
+		}
 		PostQuitMessage(0);
 		break;
 	default:
+		if (message == g_uMsgScaler && g_uMsgScaler != 0)
+		{
+			if (IsScalerManager())
+			{
+				HWND targetHWnd = (HWND)lParam;
+				if (wParam == MT_SCALER_CMD_START)
+				{
+					StartScaler(targetHWnd);
+				}
+				else if (wParam == MT_SCALER_CMD_STOP)
+				{
+					StopScaler();
+				}
+				else if (wParam == MT_SCALER_CMD_TOGGLE_ASPECT)
+				{
+					if (IsScalerActive() && g_ScaledHWnd == targetHWnd)
+					{
+						StartScaler(targetHWnd);
+					}
+				}
+			}
+			else
+			{
+				HWND hMT64 = FindWindowW(L"MENUTOOLS64", NULL);
+				if (hMT64)
+				{
+					PostMessageW(hMT64, message, wParam, lParam);
+				}
+			}
+			return 0;
+		}
 		return DefWindowProc(hWnd, message, wParam, lParam);
 	}
 	return 0;

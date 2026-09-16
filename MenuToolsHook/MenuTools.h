@@ -16,5 +16,4 @@ extern LONG wndOldWidth;
 extern LONG wndOldHeight;
 
 // Helpers
-BOOL InsertSubMenu(HMENU hMenu, HMENU hSubMenu, UINT uPosition, UINT uFlags, UINT uIDNewItem, LPCWSTR lpNewItem);
 BOOL IsMenuItem(HMENU hMenu, UINT item);
